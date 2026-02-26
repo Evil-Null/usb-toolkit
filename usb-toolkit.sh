@@ -628,9 +628,9 @@ unmount_all_partitions() {
     local force="${2:-false}"
     local failed=0
 
-    # Disable automount temporarily (prevents GNOME/KDE from re-mounting)
+    # Inhibit udev-triggered automounting during unmount operations
     if command -v udevadm &>/dev/null; then
-        udevadm lock --device="/dev/${dev}" --timeout=0 2>/dev/null || true
+        udevadm control --stop-exec-queue 2>/dev/null || true
     fi
 
     for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
@@ -649,6 +649,11 @@ unmount_all_partitions() {
             fi
         fi
     done
+
+    # Re-enable udev exec queue
+    if command -v udevadm &>/dev/null; then
+        udevadm control --start-exec-queue 2>/dev/null || true
+    fi
 
     # Verify nothing got re-mounted (TOCTOU check)
     if [[ $failed -eq 0 ]]; then
@@ -740,7 +745,7 @@ print_device_details() {
     vendor_id=$(find_usb_attr "$dev" "idVendor" "????")
     product_id=$(find_usb_attr "$dev" "idProduct" "????")
     removable=$(read_sysfs "/sys/block/${dev}/removable" "?")
-    manufacturer=$(read_sysfs "/sys/block/${dev}/device/../../manufacturer" "Unknown")
+    manufacturer=$(find_usb_attr "$dev" "manufacturer" "Unknown")
     usb_speed=$(get_usb_speed "$dev")
 
     echo -e "    ${BOLD}${GREEN}/dev/${dev}${NC}  —  ${BOLD}${size}${NC}  ${DIM}[${vendor_id}:${product_id}]${NC}"
@@ -894,7 +899,9 @@ mount_usb() {
             return
         fi
         # Expand tilde
-        mount_point="${mount_point/#\~//home/${user}}"
+        local user_home
+        user_home=$(get_user_home)
+        mount_point="${mount_point/#\~/${user_home}}"
     fi
 
     # Create mount point
@@ -1867,14 +1874,19 @@ backup_to_image() {
         # Generate SHA256 checksum
         print_info "Generating SHA256 checksum..."
         local sha_file="${img_file}.sha256"
-        sha256sum "$img_file" > "$sha_file" 2>/dev/null
-        chown "$(get_current_user):$(get_current_user)" "$sha_file" 2>/dev/null || true
-        print_ok "Checksum saved: ${sha_file}"
+        if sha256sum "$img_file" > "$sha_file" 2>/dev/null; then
+            chown "$(get_current_user):$(get_current_user)" "$sha_file" 2>/dev/null || true
+            print_ok "Checksum saved: ${sha_file}"
+        else
+            rm -f "$sha_file" 2>/dev/null || true
+            print_warn "Failed to generate SHA256 checksum"
+        fi
 
         log "BACKUP: /dev/${dev} → ${img_file} (${img_size}) compress=${compress}"
     else
+        rm -f "$img_file" 2>/dev/null || true
         CLEANUP_TMPFILES=()
-        print_fail "Backup failed"
+        print_fail "Backup failed — partial file removed"
     fi
     echo ""
 }
@@ -1947,11 +1959,11 @@ restore_from_image() {
             ;;
         gzip)
             if command -v pv &>/dev/null; then
-                if pv "$img_file" | gunzip -c | dd of="/dev/${dev}" bs=4M 2>/dev/null; then
+                if pv "$img_file" | gunzip -c | dd of="/dev/${dev}" bs=4M conv=fdatasync 2>/dev/null; then
                     restore_ok=1
                 fi
             else
-                if gunzip -c "$img_file" | dd of="/dev/${dev}" bs=4M status=progress 2>&1; then
+                if gunzip -c "$img_file" | dd of="/dev/${dev}" bs=4M conv=fdatasync status=progress 2>&1; then
                     restore_ok=1
                 fi
             fi
@@ -1962,11 +1974,11 @@ restore_from_image() {
                 return
             fi
             if command -v pv &>/dev/null; then
-                if pv "$img_file" | zstd -dc | dd of="/dev/${dev}" bs=4M 2>/dev/null; then
+                if pv "$img_file" | zstd -dc | dd of="/dev/${dev}" bs=4M conv=fdatasync 2>/dev/null; then
                     restore_ok=1
                 fi
             else
-                if zstd -dc "$img_file" | dd of="/dev/${dev}" bs=4M status=progress 2>&1; then
+                if zstd -dc "$img_file" | dd of="/dev/${dev}" bs=4M conv=fdatasync status=progress 2>&1; then
                     restore_ok=1
                 fi
             fi
@@ -2234,13 +2246,16 @@ wipe_quick() {
     log "WIPE (quick): /dev/${dev}"
 
     # Zero first 1MB (includes partition table and boot sector)
-    dd if=/dev/zero of="/dev/${dev}" bs=1M count=1 status=progress 2>&1
+    if ! dd if=/dev/zero of="/dev/${dev}" bs=1M count=1 status=progress 2>&1; then
+        print_fail "Failed to zero start of /dev/${dev}"
+        return
+    fi
     # Zero last 1MB (backup GPT table)
     local size_bytes
     size_bytes=$(blockdev --getsize64 "/dev/${dev}" 2>/dev/null || echo "0")
     if [[ "$size_bytes" -gt 1048576 ]]; then
-        local tail_offset=$(( size_bytes - 1048576 ))
-        dd if=/dev/zero of="/dev/${dev}" bs=1 seek="${tail_offset}" count=1048576 conv=notrunc status=progress 2>&1 || true
+        local seek_mb=$(( (size_bytes - 1048576) / 1048576 ))
+        dd if=/dev/zero of="/dev/${dev}" bs=1M seek="${seek_mb}" count=1 conv=notrunc status=progress 2>&1 || true
     fi
     # Wipe signatures
     wipefs -a "/dev/${dev}" &>/dev/null || true
@@ -2573,7 +2588,7 @@ cli_list() {
         local size model serial usb_speed
         size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "?")
         model=$(read_sysfs "/sys/block/${dev}/device/model" "Unknown")
-        serial=$(read_sysfs "/sys/block/${dev}/device/../../serial" "N/A")
+        serial=$(find_usb_attr "$dev" "serial" "N/A")
         usb_speed=$(get_usb_speed "$dev")
         printf "%-12s  %-8s  %-20s  %-16s  %s\n" "/dev/${dev}" "$size" "$model" "$serial" "$usb_speed"
     done
