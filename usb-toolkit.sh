@@ -1415,7 +1415,7 @@ health_badblocks() {
     timer_start
 
     local bad_count
-    bad_count=$(badblocks -sv "/dev/${dev}" 2>&1 | tee /dev/stderr | grep -c "^[0-9]" || echo "0")
+    bad_count=$(badblocks -sv "/dev/${dev}" 2>&1 | tee /dev/stderr | grep -c "^[0-9]" || true)
 
     echo ""
     if [[ "$bad_count" -eq 0 ]]; then
