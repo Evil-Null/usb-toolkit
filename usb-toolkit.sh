@@ -312,13 +312,9 @@ timer_stop() {
 read_sysfs() {
     local path="$1"
     local default="${2:-}"
-    local value
     if [[ -f "$path" ]]; then
-        value=$(< "$path" 2>/dev/null) || true
-        # Trim whitespace
-        value="${value#"${value%%[![:space:]]*}"}"
-        value="${value%"${value##*[![:space:]]}"}"
-        if [[ -n "$value" ]]; then
+        local value
+        if read -r value < "$path" 2>/dev/null && [[ -n "$value" ]]; then
             echo "$value"
             return 0
         fi
