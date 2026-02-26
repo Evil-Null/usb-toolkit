@@ -278,7 +278,7 @@ read_sysfs() {
     local default="${2:-}"
     local value
     if [[ -f "$path" ]]; then
-        value=$(< "$path")
+        value=$(< "$path" 2>/dev/null) || true
         # Trim whitespace
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
@@ -849,7 +849,8 @@ mount_usb() {
     local fstype
     fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "")
     local dev_label
-    dev_label=$(blkid -o value -s LABEL "/dev/${dev}" 2>/dev/null || echo "$dev")
+    dev_label=$(blkid -o value -s LABEL "/dev/${dev}" 2>/dev/null || echo "")
+    [[ -z "$dev_label" ]] && dev_label="$dev"
 
     echo ""
     echo -e "  ${BOLD}Device:${NC} /dev/${dev}"
@@ -1667,11 +1668,22 @@ health_write_speed_test() {
     fi
 
     # Unmount all partitions
-    unmount_all_partitions "$dev" true
+    if ! unmount_all_partitions "$dev" true; then
+        print_fail "Could not unmount all partitions — aborting"
+        return
+    fi
 
     local test_size="256MB"
     local test_blocks=64
     local block_size="4M"
+
+    local size_bytes
+    size_bytes=$(blockdev --getsize64 "/dev/${dev}" 2>/dev/null || echo "0")
+    if [[ "$size_bytes" -lt 268435456 ]]; then
+        test_blocks=$((size_bytes / 4194304))
+        [[ $test_blocks -lt 1 ]] && test_blocks=1
+        test_size="$((test_blocks * 4))MB"
+    fi
 
     echo ""
     echo -e "  ${BOLD}Writing ${test_size} to /dev/${dev}...${NC}"
@@ -1939,7 +1951,10 @@ restore_from_image() {
     fi
 
     # Unmount if needed
-    unmount_all_partitions "$dev" true
+    if ! unmount_all_partitions "$dev" true; then
+        print_fail "Could not unmount all partitions — aborting"
+        return
+    fi
 
     if ! double_confirm "$dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -1959,14 +1974,14 @@ restore_from_image() {
             ;;
         gzip)
             if command -v pv &>/dev/null; then
-                if pv "$img_file" | gunzip -c | dd of="/dev/${dev}" bs=4M conv=fdatasync 2>/dev/null; then
-                    restore_ok=1
-                fi
+                pv "$img_file" | gunzip -c | dd of="/dev/${dev}" bs=4M conv=fdatasync 2>/dev/null
             else
-                if gunzip -c "$img_file" | dd of="/dev/${dev}" bs=4M conv=fdatasync status=progress 2>&1; then
-                    restore_ok=1
-                fi
+                gunzip -c "$img_file" | dd of="/dev/${dev}" bs=4M conv=fdatasync status=progress 2>&1
             fi
+            local pipe_gz=("${PIPESTATUS[@]}")
+            local gz_ok=1
+            for s in "${pipe_gz[@]}"; do [[ "$s" -ne 0 ]] && gz_ok=0; done
+            [[ $gz_ok -eq 1 ]] && restore_ok=1
             ;;
         zstd)
             if ! command -v zstd &>/dev/null; then
@@ -1974,14 +1989,14 @@ restore_from_image() {
                 return
             fi
             if command -v pv &>/dev/null; then
-                if pv "$img_file" | zstd -dc | dd of="/dev/${dev}" bs=4M conv=fdatasync 2>/dev/null; then
-                    restore_ok=1
-                fi
+                pv "$img_file" | zstd -dc | dd of="/dev/${dev}" bs=4M conv=fdatasync 2>/dev/null
             else
-                if zstd -dc "$img_file" | dd of="/dev/${dev}" bs=4M conv=fdatasync status=progress 2>&1; then
-                    restore_ok=1
-                fi
+                zstd -dc "$img_file" | dd of="/dev/${dev}" bs=4M conv=fdatasync status=progress 2>&1
             fi
+            local pipe_zst=("${PIPESTATUS[@]}")
+            local zst_ok=1
+            for s in "${pipe_zst[@]}"; do [[ "$s" -ne 0 ]] && zst_ok=0; done
+            [[ $zst_ok -eq 1 ]] && restore_ok=1
             ;;
     esac
 
@@ -2038,15 +2053,28 @@ clone_usb_to_usb() {
         return
     fi
 
-    local src_size tgt_size
+    local src_size tgt_size src_bytes tgt_bytes
     src_size=$(lsblk -dnro SIZE "/dev/${source_dev}" 2>/dev/null)
     tgt_size=$(lsblk -dnro SIZE "/dev/${target_dev}" 2>/dev/null)
+    src_bytes=$(blockdev --getsize64 "/dev/${source_dev}" 2>/dev/null || echo "0")
+    tgt_bytes=$(blockdev --getsize64 "/dev/${target_dev}" 2>/dev/null || echo "0")
+
+    # Check target is large enough
+    if [[ "$src_bytes" =~ ^[0-9]+$ ]] && [[ "$tgt_bytes" =~ ^[0-9]+$ ]]; then
+        if [[ "$src_bytes" -gt "$tgt_bytes" ]]; then
+            print_fail "Source (${src_size}) is larger than target (${tgt_size}) — clone would be truncated"
+            return
+        fi
+    fi
 
     echo ""
     echo -e "  ${BOLD}Clone:${NC} /dev/${source_dev} (${src_size}) → /dev/${target_dev} (${tgt_size})"
 
     # Unmount target
-    unmount_all_partitions "$target_dev" true
+    if ! unmount_all_partitions "$target_dev" true; then
+        print_fail "Could not unmount target partitions — aborting"
+        return
+    fi
 
     if ! double_confirm "$target_dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -2156,7 +2184,10 @@ write_iso() {
     echo -e "    Target: /dev/${dev} (${dev_size})"
 
     # Unmount if needed
-    unmount_all_partitions "$dev" true
+    if ! unmount_all_partitions "$dev" true; then
+        print_fail "Could not unmount all partitions — aborting"
+        return
+    fi
 
     if ! double_confirm "$dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -2357,7 +2388,10 @@ secure_wipe() {
     echo -e "  ${BOLD}Device:${NC} /dev/${dev} (${size})"
 
     # Unmount all partitions
-    unmount_all_partitions "$dev" true
+    if ! unmount_all_partitions "$dev" true; then
+        print_fail "Could not unmount all partitions — aborting"
+        return
+    fi
 
     echo ""
     echo -e "  ${BOLD}Wipe method:${NC}"
