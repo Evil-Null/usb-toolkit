@@ -61,6 +61,24 @@ else
 fi
 
 # ============================================================================
+#  Gum Detection & Theme
+# ============================================================================
+
+HAS_GUM=false
+if [[ -t 1 ]] && command -v gum &>/dev/null; then
+    HAS_GUM=true
+fi
+
+# Gum color scheme — matches existing ANSI palette
+readonly GUM_GREEN="#22c55e"
+readonly GUM_RED="#ef4444"
+readonly GUM_YELLOW="#eab308"
+readonly GUM_CYAN="#06b6d4"
+readonly GUM_BLUE="#3b82f6"
+readonly GUM_MAGENTA="#a855f7"
+readonly GUM_DIM="#6b7280"
+
+# ============================================================================
 #  Signal Trap & Cleanup
 # ============================================================================
 
@@ -161,16 +179,34 @@ print_warn() {
 }
 
 print_header() {
-    echo ""
-    echo -e "${BLUE}${BOLD}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}${BOLD}    $1${NC}"
-    echo -e "${BLUE}${BOLD}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if [[ "$HAS_GUM" == true ]]; then
+        echo ""
+        gum style \
+            --border "rounded" \
+            --border-foreground "$GUM_BLUE" \
+            --foreground "$GUM_BLUE" \
+            --bold \
+            --padding "0 2" \
+            --width 58 \
+            "  $1"
+    else
+        echo ""
+        echo -e "${BLUE}${BOLD}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}${BOLD}    $1${NC}"
+        echo -e "${BLUE}${BOLD}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    fi
 }
 
 print_section() {
-    echo ""
-    echo -e "  ${CYAN}${BOLD}  [$1]  $2${NC}"
-    echo -e "  ${CYAN}  ─────────────────────────────────────────────────${NC}"
+    if [[ "$HAS_GUM" == true ]]; then
+        echo ""
+        gum style --foreground "$GUM_CYAN" --bold "  [$1]  $2"
+        echo -e "  ${CYAN}  ─────────────────────────────────────────────────${NC}"
+    else
+        echo ""
+        echo -e "  ${CYAN}${BOLD}  [$1]  $2${NC}"
+        echo -e "  ${CYAN}  ─────────────────────────────────────────────────${NC}"
+    fi
 }
 
 # ============================================================================
@@ -329,9 +365,18 @@ dd_with_progress() {
 
 confirm_action() {
     local msg="$1"
-    echo ""
-    read -rp "  ${msg} [y/N]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]]
+    if [[ "$HAS_GUM" == true ]]; then
+        gum confirm \
+            --prompt.foreground "$GUM_YELLOW" \
+            --selected.background "$GUM_GREEN" \
+            --unselected.background "$GUM_DIM" \
+            --default=false \
+            "$msg"
+    else
+        echo ""
+        read -rp "  ${msg} [y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]]
+    fi
 }
 
 double_confirm() {
@@ -340,37 +385,63 @@ double_confirm() {
     local model size
     model=$(read_sysfs "/sys/block/${device}/device/model" || echo "")
     size=$(lsblk -dnro SIZE "/dev/${device}" 2>/dev/null || echo "?")
-    # Dynamic width based on content — ensure minimum 52 cols
-    local inner_text="ALL DATA ON ${dev_display} WILL BE DESTROYED!"
-    local title="*** DESTRUCTIVE OPERATION ***"
-    local text_len=${#inner_text}
-    local title_len=${#title}
-    local min_content=$(( text_len > title_len ? text_len : title_len ))
-    local box_width=$(( min_content + 8 ))
-    [[ $box_width -lt 52 ]] && box_width=52
-    local pad_total=$((box_width - text_len - 2))
-    local pad_left=$((pad_total / 2))
-    local pad_right=$((pad_total - pad_left))
-    local border_inner=""
-    local title_pad_total=$((box_width - title_len - 2))
-    local title_pad_left=$((title_pad_total / 2))
-    local title_pad_right=$((title_pad_total - title_pad_left))
 
-    printf -v border_inner '%*s' "$((box_width - 2))" ''
-    border_inner="${border_inner// /═}"
+    if [[ "$HAS_GUM" == true ]]; then
+        echo ""
+        gum style \
+            --border "double" \
+            --border-foreground "$GUM_RED" \
+            --foreground "$GUM_RED" \
+            --bold \
+            --padding "0 2" \
+            --align "center" \
+            "*** DESTRUCTIVE OPERATION ***" \
+            "" \
+            "ALL DATA ON ${dev_display} WILL BE DESTROYED!"
+        [[ -n "$model" ]] && echo -e "  ${RED}  Device: ${model} (${size})${NC}"
+        echo ""
+        local typed
+        typed=$(gum input \
+            --prompt "  Type '${device}' to confirm: " \
+            --prompt.foreground "$GUM_YELLOW" \
+            --placeholder "${device}" \
+            --width 40)
+        if [[ "$typed" != "$device" ]]; then
+            echo -e "  ${RED}  Input '${typed}' does not match '${device}' — cancelled.${NC}"
+            return 1
+        fi
+    else
+        local inner_text="ALL DATA ON ${dev_display} WILL BE DESTROYED!"
+        local title="*** DESTRUCTIVE OPERATION ***"
+        local text_len=${#inner_text}
+        local title_len=${#title}
+        local min_content=$(( text_len > title_len ? text_len : title_len ))
+        local box_width=$(( min_content + 8 ))
+        [[ $box_width -lt 52 ]] && box_width=52
+        local pad_total=$((box_width - text_len - 2))
+        local pad_left=$((pad_total / 2))
+        local pad_right=$((pad_total - pad_left))
+        local border_inner=""
+        local title_pad_total=$((box_width - title_len - 2))
+        local title_pad_left=$((title_pad_total / 2))
+        local title_pad_right=$((title_pad_total - title_pad_left))
 
-    echo ""
-    echo -e "  ${RED}${BOLD}  ╔${border_inner}╗${NC}"
-    printf "  %b  ║%*s%s%*s║%b\n" "${RED}${BOLD}" "$title_pad_left" "" "$title" "$title_pad_right" "" "${NC}"
-    printf "  %b  ║%*s%s%*s║%b\n" "${RED}${BOLD}" "$pad_left" "" "$inner_text" "$pad_right" "" "${NC}"
-    echo -e "  ${RED}${BOLD}  ╚${border_inner}╝${NC}"
-    [[ -n "$model" ]] && echo -e "  ${RED}  Device: ${model} (${size})${NC}"
-    echo ""
-    echo -e "  ${YELLOW}  Type '${BOLD}${device}${NC}${YELLOW}' to confirm:${NC}"
-    read -rp "  > " typed
-    if [[ "$typed" != "$device" ]]; then
-        echo -e "  ${RED}  Input '${typed}' does not match '${device}' — cancelled.${NC}"
-        return 1
+        printf -v border_inner '%*s' "$((box_width - 2))" ''
+        border_inner="${border_inner// /═}"
+
+        echo ""
+        echo -e "  ${RED}${BOLD}  ╔${border_inner}╗${NC}"
+        printf "  %b  ║%*s%s%*s║%b\n" "${RED}${BOLD}" "$title_pad_left" "" "$title" "$title_pad_right" "" "${NC}"
+        printf "  %b  ║%*s%s%*s║%b\n" "${RED}${BOLD}" "$pad_left" "" "$inner_text" "$pad_right" "" "${NC}"
+        echo -e "  ${RED}${BOLD}  ╚${border_inner}╝${NC}"
+        [[ -n "$model" ]] && echo -e "  ${RED}  Device: ${model} (${size})${NC}"
+        echo ""
+        echo -e "  ${YELLOW}  Type '${BOLD}${device}${NC}${YELLOW}' to confirm:${NC}"
+        read -rp "  > " typed
+        if [[ "$typed" != "$device" ]]; then
+            echo -e "  ${RED}  Input '${typed}' does not match '${device}' — cancelled.${NC}"
+            return 1
+        fi
     fi
     return 0
 }
@@ -385,6 +456,120 @@ get_user_home() {
     user=$(get_current_user)
     getent passwd "$user" 2>/dev/null | cut -d: -f6 || echo "${HOME:-/root}"
 }
+
+# ============================================================================
+#  Gum UI Helpers (with fallback when gum is not installed)
+# ============================================================================
+
+# ui_choose: Interactive menu selection
+# Args: $1 = header, remaining = options
+# Returns: selected option text on stdout
+ui_choose() {
+    local header="$1"
+    shift
+    local -a options=("$@")
+
+    if [[ "$HAS_GUM" == true ]]; then
+        gum choose \
+            --header "$header" \
+            --header.foreground "$GUM_CYAN" \
+            --cursor.foreground "$GUM_GREEN" \
+            --selected.foreground "$GUM_GREEN" \
+            --height 15 \
+            "${options[@]}"
+    else
+        echo ""
+        echo -e "  ${BOLD}${header}${NC}"
+        echo ""
+        local i=1
+        for opt in "${options[@]}"; do
+            printf "    %b%2d)%b  %s\n" "${GREEN}" "$i" "${NC}" "$opt"
+            i=$((i + 1))
+        done
+        echo ""
+        read -rp "  Choice [1-${#options[@]}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#options[@]} ]]; then
+            echo "${options[$((choice - 1))]}"
+        fi
+    fi
+}
+
+# ui_input: Single-line text input
+# Args: $1 = prompt, $2 = default value (optional)
+# Returns: user input on stdout
+ui_input() {
+    local prompt="$1"
+    local default="${2:-}"
+
+    if [[ "$HAS_GUM" == true ]]; then
+        local -a args=(
+            --prompt "  ${prompt}: "
+            --prompt.foreground "$GUM_CYAN"
+            --width 60
+        )
+        [[ -n "$default" ]] && args+=(--value "$default")
+        gum input "${args[@]}"
+    else
+        local display_prompt="  ${prompt}"
+        [[ -n "$default" ]] && display_prompt+=" [${default}]"
+        display_prompt+=": "
+        local value
+        read -rp "$display_prompt" value
+        echo "${value:-$default}"
+    fi
+}
+
+# ui_file_input: File path input with optional gum file picker
+# Args: $1 = prompt, $2 = starting directory (optional)
+# Returns: selected file path on stdout
+ui_file_input() {
+    local prompt="$1"
+    local start_dir="${2:-$(get_user_home)}"
+
+    if [[ "$HAS_GUM" == true ]]; then
+        local method
+        method=$(gum choose \
+            --header "$prompt" \
+            --header.foreground "$GUM_CYAN" \
+            --cursor.foreground "$GUM_GREEN" \
+            "Browse files" \
+            "Type path manually")
+        case "$method" in
+            "Browse files")
+                gum file "$start_dir"
+                ;;
+            *)
+                gum input \
+                    --prompt "  Path: " \
+                    --prompt.foreground "$GUM_CYAN" \
+                    --placeholder "/path/to/file" \
+                    --width 80
+                ;;
+        esac
+    else
+        local value
+        read -rep "  ${prompt}: " value
+        echo "$value"
+    fi
+}
+
+# ui_pause: Wait for user to press Enter
+ui_pause() {
+    if [[ "$HAS_GUM" == true ]]; then
+        echo ""
+        gum input --prompt "  Press Enter to return to menu... " \
+            --prompt.foreground "$GUM_DIM" \
+            --placeholder "" \
+            --width 50 > /dev/null 2>&1
+    else
+        echo ""
+        read -rp "  Press Enter to return to menu... " _
+    fi
+}
+
+# ============================================================================
+#  Root & Dependency Checks
+# ============================================================================
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -418,7 +603,7 @@ check_dependencies() {
     fi
 
     # Optional tools
-    local optional=("pv" "smartctl" "badblocks" "ntfs-3g" "mkfs.exfat" "mkfs.btrfs" "mkfs.f2fs" "mkfs.xfs" "zstd")
+    local optional=("gum" "pv" "smartctl" "badblocks" "ntfs-3g" "mkfs.exfat" "mkfs.btrfs" "mkfs.f2fs" "mkfs.xfs" "zstd")
     for cmd in "${optional[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
             optional_missing+=("$cmd")
@@ -579,46 +764,68 @@ select_device() {
         return 1
     fi
 
-    echo ""
-    echo -e "  ${BOLD}Available ${label}:${NC}"
-    echo ""
-
-    local i=1
+    # Build display labels for each device
+    local -a display_labels=()
     for dev in "${dev_list[@]}"; do
-        local size model fstype label_name
+        local size model fstype label_name entry
         size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "?")
         model=$(lsblk -dnro MODEL "/dev/${dev}" 2>/dev/null || echo "")
         fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "")
         label_name=$(blkid -o value -s LABEL "/dev/${dev}" 2>/dev/null || echo "")
 
-        printf "    %b%2d)%b  /dev/%-8s  %b%6s%b" "${GREEN}" "$i" "${NC}" "$dev" "${BOLD}" "$size" "${NC}"
-        [[ -n "$fstype" ]] && printf "  %b[%s]%b" "${DIM}" "$fstype" "${NC}"
-        [[ -n "$label_name" ]] && printf "  %b%s%b" "${CYAN}" "$label_name" "${NC}"
-        [[ -n "$model" ]] && printf "  %b%s%b" "${DIM}" "$model" "${NC}"
-        echo ""
-        i=$((i + 1))
+        entry="/dev/${dev}  ${size}"
+        [[ -n "$fstype" ]] && entry+="  [${fstype}]"
+        [[ -n "$label_name" ]] && entry+="  ${label_name}"
+        [[ -n "$model" ]] && entry+="  ${model}"
+        display_labels+=("$entry")
     done
 
-    echo ""
-    read -rp "  Select device [1-${#dev_list[@]}] (0 to cancel): " choice
+    local selected=""
+    if [[ "$HAS_GUM" == true ]]; then
+        display_labels+=("Cancel")
+        selected=$(gum choose \
+            --header "Select ${label}:" \
+            --header.foreground "$GUM_CYAN" \
+            --cursor.foreground "$GUM_GREEN" \
+            --selected.foreground "$GUM_GREEN" \
+            --height 15 \
+            "${display_labels[@]}")
 
-    if [[ "$choice" == "0" || -z "$choice" ]]; then
+        [[ -z "$selected" || "$selected" == "Cancel" ]] && return 1
+    else
+        echo ""
+        echo -e "  ${BOLD}Available ${label}:${NC}"
+        echo ""
+        local i=1
+        for entry in "${display_labels[@]}"; do
+            printf "    %b%2d)%b  %s\n" "${GREEN}" "$i" "${NC}" "$entry"
+            i=$((i + 1))
+        done
+        echo ""
+        read -rp "  Select device [1-${#dev_list[@]}] (0 to cancel): " choice
+
+        [[ "$choice" == "0" || -z "$choice" ]] && return 1
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#dev_list[@]} ]]; then
+            selected="${display_labels[$((choice - 1))]}"
+        else
+            echo -e "  ${RED}Invalid selection${NC}"
+            return 1
+        fi
+    fi
+
+    # Extract device name from display label ("/dev/sdb  ..." -> "sdb")
+    local chosen_dev
+    chosen_dev=$(echo "$selected" | awk '{print $1}' | sed 's|/dev/||')
+
+    # Verify device still exists
+    if [[ ! -b "/dev/${chosen_dev}" ]]; then
+        echo -e "  ${RED}/dev/${chosen_dev} no longer exists — device may have been removed${NC}"
         return 1
     fi
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#dev_list[@]} ]]; then
-        local selected="${dev_list[$((choice - 1))]}"
-        # Verify device still exists (may have been removed while user was choosing)
-        if [[ ! -b "/dev/${selected}" ]]; then
-            echo -e "  ${RED}/dev/${selected} no longer exists — device may have been removed${NC}"
-            return 1
-        fi
-        _result_var="$selected"
-        return 0
-    fi
-
-    echo -e "  ${RED}Invalid selection${NC}"
-    return 1
+    _result_var="$chosen_dev"
+    return 0
 }
 
 # Unmount all partitions of a device. Returns 1 if any unmount fails.
@@ -814,18 +1021,16 @@ detect_list_devices() {
 
 detect_menu() {
     print_header "Category 1: USB Device Detection"
-    echo ""
     echo -e "  ${DIM}  Detect and display information about connected USB storage devices.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  List all USB storage devices"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-1]: " choice
+
+    local choice
+    choice=$(ui_choose "Select:" \
+        "List all USB storage devices" \
+        "Back")
 
     case "$choice" in
-        1) detect_list_devices ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"List"*) detect_list_devices ;;
+        *) return ;;
     esac
 }
 
@@ -858,31 +1063,27 @@ mount_usb() {
     echo -e "  ${BOLD}Label:${NC} ${dev_label}"
 
     # Mount options
-    echo ""
-    echo -e "  ${BOLD}Mount mode:${NC}"
-    echo -e "    ${GREEN}1)${NC}  Read-Write ${DIM}(default)${NC}"
-    echo -e "    ${CYAN}2)${NC}  Read-Only"
-    echo -e "    ${YELLOW}3)${NC}  Read-Write + noexec + sync"
-    echo -e "    ${MAGENTA}4)${NC}  Custom options"
-    echo ""
-    read -rp "  Choice [1-4]: " mode
+    local mode
+    mode=$(ui_choose "Mount mode:" \
+        "Read-Write (default)" \
+        "Read-Only" \
+        "Read-Write + noexec + sync" \
+        "Custom options")
 
     local -a mount_args=()
     case "$mode" in
-        1|"") ;;
-        2) mount_args+=("-o" "ro") ;;
-        3) mount_args+=("-o" "noexec,sync") ;;
-        4)
-            read -rp "  Enter mount options (e.g. ro,noexec,sync): " custom_opts
+        *"Read-Write (default)"*|"") ;;
+        *"Read-Only"*) mount_args+=("-o" "ro") ;;
+        *"noexec"*) mount_args+=("-o" "noexec,sync") ;;
+        *"Custom"*)
+            local custom_opts
+            custom_opts=$(ui_input "Mount options (e.g. ro,noexec,sync)")
             if ! validate_mount_options "$custom_opts"; then
                 return
             fi
             mount_args+=("-o" "${custom_opts}")
             ;;
-        *)
-            echo -e "  ${RED}Invalid choice${NC}"
-            return
-            ;;
+        *) return ;;
     esac
 
     # Mount point
@@ -890,7 +1091,8 @@ mount_usb() {
     user=$(get_current_user)
     local default_mount="/media/${user}/${dev_label}"
     echo ""
-    read -rp "  Mount point [${default_mount}]: " custom_mount
+    local custom_mount
+    custom_mount=$(ui_input "Mount point" "$default_mount")
     local mount_point="${custom_mount:-$default_mount}"
 
     # Validate mount point — reject shell metacharacters
@@ -941,18 +1143,16 @@ mount_usb() {
 
 mount_menu() {
     print_header "Category 2: Mount USB"
-    echo ""
     echo -e "  ${DIM}  Mount USB partitions with various options.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Mount a USB device"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-1]: " choice
+
+    local choice
+    choice=$(ui_choose "Select:" \
+        "Mount a USB device" \
+        "Back")
 
     case "$choice" in
-        1) mount_usb ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"Mount"*) mount_usb ;;
+        *) return ;;
     esac
 }
 
@@ -1006,20 +1206,17 @@ unmount_usb() {
     echo -e "  ${BOLD}Device:${NC}     /dev/${dev}"
     echo -e "  ${BOLD}Mounted at:${NC} ${mount_point}"
 
-    echo ""
-    echo -e "  ${BOLD}Unmount mode:${NC}"
-    echo -e "    ${GREEN}1)${NC}  Safe unmount ${DIM}(sync then umount)${NC}"
-    echo -e "    ${YELLOW}2)${NC}  Force unmount ${DIM}(umount -f — for busy devices)${NC}"
-    echo -e "    ${MAGENTA}3)${NC}  Lazy unmount  ${DIM}(umount -l — detach now, clean up later)${NC}"
-    echo -e "    ${CYAN}4)${NC}  Show processes using this device"
-    echo ""
-    read -rp "  Choice [1-4]: " mode
+    local mode
+    mode=$(ui_choose "Unmount mode:" \
+        "Safe unmount    — sync then umount" \
+        "Force unmount   — umount -f (busy devices)" \
+        "Lazy unmount    — umount -l (detach now)" \
+        "Show processes using this device")
 
     case "$mode" in
-        1)
+        *"Safe unmount"*)
             print_info "Syncing filesystem..."
             sync
-            # Unmount by mount point (more reliable than device path for bind mounts)
             if [[ -n "$mount_point" ]] && umount "$mount_point" 2>/dev/null; then
                 print_ok "Unmounted /dev/${dev} from ${mount_point}"
                 log "UNMOUNT: /dev/${dev} from ${mount_point}"
@@ -1032,7 +1229,7 @@ unmount_usb() {
                 unmount_show_processes "$dev" "$mount_point"
             fi
             ;;
-        2)
+        *"Force unmount"*)
             print_warn "Force unmounting /dev/${dev}..."
             sync
             if [[ -n "$mount_point" ]] && umount -f "$mount_point" 2>/dev/null; then
@@ -1044,10 +1241,10 @@ unmount_usb() {
                 log "UNMOUNT (force): /dev/${dev}"
             else
                 print_fail "Force unmount failed"
-                print_info "Try lazy unmount (option 3)"
+                print_info "Try lazy unmount"
             fi
             ;;
-        3)
+        *"Lazy unmount"*)
             print_warn "Lazy unmounting /dev/${dev}..."
             sync
             if [[ -n "$mount_point" ]] && umount -l "$mount_point" 2>/dev/null; then
@@ -1061,30 +1258,26 @@ unmount_usb() {
                 print_fail "Lazy unmount failed"
             fi
             ;;
-        4)
+        *"Show processes"*)
             unmount_show_processes "$dev" "$mount_point"
             ;;
-        *)
-            echo -e "  ${RED}Invalid choice${NC}"
-            ;;
+        *) ;;
     esac
     echo ""
 }
 
 unmount_menu() {
     print_header "Category 3: Unmount USB"
-    echo ""
     echo -e "  ${DIM}  Safely unmount USB devices with sync and process check.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Unmount a USB device"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-1]: " choice
+
+    local choice
+    choice=$(ui_choose "Select:" \
+        "Unmount a USB device" \
+        "Back")
 
     case "$choice" in
-        1) unmount_usb ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"Unmount"*) unmount_usb ;;
+        *) return ;;
     esac
 }
 
@@ -1138,41 +1331,36 @@ format_usb() {
     fi
 
     # Partition table
-    echo ""
-    echo -e "  ${BOLD}Partition table:${NC}"
-    echo -e "    ${GREEN}1)${NC}  MBR (dos) ${DIM}— compatible with most devices (default)${NC}"
-    echo -e "    ${CYAN}2)${NC}  GPT       ${DIM}— modern, supports >2TB${NC}"
-    echo ""
-    read -rp "  Choice [1-2]: " pt_choice
+    local pt_choice
+    pt_choice=$(ui_choose "Partition table:" \
+        "MBR (dos) — compatible with most devices" \
+        "GPT       — modern, supports >2TB")
 
     local pt_type="msdos"
     case "$pt_choice" in
-        1|"") pt_type="msdos" ;;
-        2) pt_type="gpt" ;;
-        *) echo -e "  ${RED}Invalid choice, using MBR${NC}"; pt_type="msdos" ;;
+        *"MBR"*|"") pt_type="msdos" ;;
+        *"GPT"*) pt_type="gpt" ;;
     esac
 
     # Filesystem
-    echo ""
-    echo -e "  ${BOLD}Filesystem:${NC}"
-    echo -e "    ${GREEN}1)${NC}  FAT32   ${DIM}— universal compatibility (max 4GB file)${NC}"
-    echo -e "    ${CYAN}2)${NC}  exFAT   ${DIM}— large file support, cross-platform${NC}"
-    echo -e "    ${MAGENTA}3)${NC}  NTFS    ${DIM}— Windows compatible, large files${NC}"
-    echo -e "    ${YELLOW}4)${NC}  ext4    ${DIM}— Linux native, journaled${NC}"
-    echo -e "    ${BLUE}5)${NC}  Btrfs   ${DIM}— Linux, COW, snapshots${NC}"
-    echo -e "    ${GREEN}6)${NC}  F2FS    ${DIM}— Flash-Friendly FS (USB/SD optimized)${NC}"
-    echo -e "    ${CYAN}7)${NC}  XFS     ${DIM}— High-performance journaling${NC}"
-    echo ""
-    read -rp "  Choice [1-7]: " fs_choice
+    local fs_choice
+    fs_choice=$(ui_choose "Filesystem:" \
+        "FAT32   — universal compatibility (max 4GB file)" \
+        "exFAT   — large file support, cross-platform" \
+        "NTFS    — Windows compatible, large files" \
+        "ext4    — Linux native, journaled" \
+        "Btrfs   — Linux, COW, snapshots" \
+        "F2FS    — Flash-Friendly FS (USB/SD optimized)" \
+        "XFS     — High-performance journaling")
 
     local fs_type=""
     local -a mkfs_args=()
     case "$fs_choice" in
-        1|"")
+        *"FAT32"*|"")
             fs_type="fat32"
             mkfs_args=("mkfs.vfat" "-F" "32")
             ;;
-        2)
+        *"exFAT"*)
             if ! command -v mkfs.exfat &>/dev/null; then
                 print_fail "mkfs.exfat not found. Install: sudo apt install exfat-utils"
                 return
@@ -1180,7 +1368,7 @@ format_usb() {
             fs_type="exfat"
             mkfs_args=("mkfs.exfat")
             ;;
-        3)
+        *"NTFS"*)
             if ! command -v mkfs.ntfs &>/dev/null; then
                 print_fail "mkfs.ntfs not found. Install: sudo apt install ntfs-3g"
                 return
@@ -1188,11 +1376,11 @@ format_usb() {
             fs_type="ntfs"
             mkfs_args=("mkfs.ntfs" "-f")
             ;;
-        4)
+        *"ext4"*)
             fs_type="ext4"
             mkfs_args=("mkfs.ext4" "-F")
             ;;
-        5)
+        *"Btrfs"*)
             if ! command -v mkfs.btrfs &>/dev/null; then
                 print_fail "mkfs.btrfs not found. Install: sudo apt install btrfs-progs"
                 return
@@ -1200,7 +1388,7 @@ format_usb() {
             fs_type="btrfs"
             mkfs_args=("mkfs.btrfs" "-f")
             ;;
-        6)
+        *"F2FS"*)
             if ! command -v mkfs.f2fs &>/dev/null; then
                 print_fail "mkfs.f2fs not found. Install: sudo apt install f2fs-tools"
                 return
@@ -1208,7 +1396,7 @@ format_usb() {
             fs_type="f2fs"
             mkfs_args=("mkfs.f2fs" "-f")
             ;;
-        7)
+        *"XFS"*)
             if ! command -v mkfs.xfs &>/dev/null; then
                 print_fail "mkfs.xfs not found. Install: sudo apt install xfsprogs"
                 return
@@ -1223,8 +1411,8 @@ format_usb() {
     esac
 
     # Volume label
-    echo ""
-    read -rp "  Volume label (leave empty for none): " vol_label
+    local vol_label
+    vol_label=$(ui_input "Volume label (leave empty for none)")
 
     if [[ -n "$vol_label" ]]; then
         if ! validate_volume_label "$vol_label" "$fs_type"; then
@@ -1233,12 +1421,12 @@ format_usb() {
     fi
 
     # Format type
-    echo ""
-    echo -e "  ${BOLD}Format mode:${NC}"
-    echo -e "    ${GREEN}1)${NC}  Quick format ${DIM}(default — fast)${NC}"
-    echo -e "    ${RED}2)${NC}  Full format  ${DIM}(zero disk first — slow but thorough)${NC}"
-    echo ""
-    read -rp "  Choice [1-2]: " fmt_mode
+    local fmt_choice
+    fmt_choice=$(ui_choose "Format mode:" \
+        "Quick format (default — fast)" \
+        "Full format (zero disk first — slow but thorough)")
+    local fmt_mode=""
+    [[ "$fmt_choice" == *"Full"* ]] && fmt_mode="full"
 
     # Final confirmation
     echo ""
@@ -1247,7 +1435,7 @@ format_usb() {
     echo -e "    Partition:  ${pt_type}"
     echo -e "    Filesystem: ${fs_type}"
     [[ -n "$vol_label" ]] && echo -e "    Label:      ${vol_label}"
-    echo -e "    Mode:       $([ "${fmt_mode}" == "2" ] && echo "Full (zero first)" || echo "Quick")"
+    echo -e "    Mode:       $([ "${fmt_mode}" == "full" ] && echo "Full (zero first)" || echo "Quick")"
 
     if ! double_confirm "$dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -1258,7 +1446,7 @@ format_usb() {
     timer_start
 
     # Full format — zero disk first
-    if [[ "$fmt_mode" == "2" ]]; then
+    if [[ "$fmt_mode" == "full" ]]; then
         print_info "Zeroing disk (this may take a while)..."
         dd_with_progress "/dev/zero" "/dev/${dev}" "4M" || true
         sync
@@ -1354,18 +1542,16 @@ format_usb() {
 
 format_menu() {
     print_header "Category 4: Format USB"
-    echo ""
     echo -e "  ${DIM}  Format USB drives with filesystem and partition table options.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Format a USB device"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-1]: " choice
+
+    local choice
+    choice=$(ui_choose "Select:" \
+        "Format a USB device" \
+        "Back")
 
     case "$choice" in
-        1) format_usb ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"Format"*) format_usb ;;
+        *) return ;;
     esac
 }
 
@@ -1715,26 +1901,24 @@ health_write_speed_test() {
 
 health_menu() {
     print_header "Category 5: USB Health Check"
-    echo ""
     echo -e "  ${DIM}  Diagnose and test USB drive health.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Bad blocks test    ${DIM}(read-only scan)${NC}"
-    echo -e "    ${CYAN}2)${NC}  SMART data          ${DIM}(if supported)${NC}"
-    echo -e "    ${YELLOW}3)${NC}  Filesystem check    ${DIM}(fsck — device must be unmounted)${NC}"
-    echo -e "    ${MAGENTA}4)${NC}  Read speed test     ${DIM}(non-destructive dd benchmark)${NC}"
-    echo -e "    ${RED}5)${NC}  Write speed test    ${DIM}(DESTRUCTIVE — erases data!)${NC}"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-5]: " choice
+
+    local choice
+    choice=$(ui_choose "Select test:" \
+        "Bad blocks test      — read-only scan" \
+        "SMART data           — if supported" \
+        "Filesystem check     — fsck (must be unmounted)" \
+        "Read speed test      — non-destructive" \
+        "Write speed test     — DESTRUCTIVE!" \
+        "Back")
 
     case "$choice" in
-        1) health_badblocks ;;
-        2) health_smart ;;
-        3) health_fsck ;;
-        4) health_read_speed_test ;;
-        5) health_write_speed_test ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"Bad blocks"*)    health_badblocks ;;
+        *"SMART"*)         health_smart ;;
+        *"Filesystem"*)    health_fsck ;;
+        *"Read speed"*)    health_read_speed_test ;;
+        *"Write speed"*)   health_write_speed_test ;;
+        *) return ;;
     esac
 }
 
@@ -1764,22 +1948,19 @@ backup_to_image() {
     echo -e "  ${BOLD}Source:${NC} /dev/${dev} (${size})"
 
     # Compression choice
-    echo ""
-    echo -e "  ${BOLD}Compression:${NC}"
-    echo -e "    ${GREEN}1)${NC}  None     ${DIM}(raw .img — fastest, largest file)${NC}"
-    echo -e "    ${CYAN}2)${NC}  gzip     ${DIM}(.img.gz — good compression, slower)${NC}"
+    local -a compress_opts=("None (raw .img — fastest, largest file)" "gzip (.img.gz — good compression, slower)")
     if command -v zstd &>/dev/null; then
-        echo -e "    ${MAGENTA}3)${NC}  zstd     ${DIM}(.img.zst — fast compression, good ratio)${NC}"
+        compress_opts+=("zstd (.img.zst — fast compression, good ratio)")
     fi
-    echo ""
-    read -rp "  Choice [1-3]: " compress_choice
+    local compress_choice
+    compress_choice=$(ui_choose "Compression:" "${compress_opts[@]}")
 
     local compress="none"
     local ext=".img"
     case "$compress_choice" in
-        1|"") compress="none"; ext=".img" ;;
-        2) compress="gzip"; ext=".img.gz" ;;
-        3)
+        *"None"*|"") compress="none"; ext=".img" ;;
+        *"gzip"*) compress="gzip"; ext=".img.gz" ;;
+        *"zstd"*)
             if command -v zstd &>/dev/null; then
                 compress="zstd"; ext=".img.zst"
             else
@@ -1790,10 +1971,10 @@ backup_to_image() {
         *) echo -e "  ${RED}Invalid choice, using no compression${NC}" ;;
     esac
 
-    echo ""
     local default_img
     default_img="$(get_user_home)/usb-backup-${dev}-$(date +%Y%m%d-%H%M%S)${ext}"
-    read -rp "  Output file [${default_img}]: " custom_img
+    local custom_img
+    custom_img=$(ui_input "Output file" "$default_img")
     local img_file="${custom_img:-$default_img}"
 
     # Validate and expand path
@@ -1907,8 +2088,8 @@ restore_from_image() {
     print_header "Restore Image to USB"
     log "ACTION: Restore image to USB"
 
-    echo ""
-    read -rep "  Path to image file: " img_file_raw
+    local img_file_raw
+    img_file_raw=$(ui_file_input "Select image file")
 
     # Validate and expand path
     local img_file
@@ -2098,21 +2279,20 @@ clone_usb_to_usb() {
 
 backup_menu() {
     print_header "Category 6: USB Backup & Clone"
-    echo ""
     echo -e "  ${DIM}  Create disk images, restore from images, and clone USB drives.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Backup USB → image file   ${DIM}(dd, optional compression)${NC}"
-    echo -e "    ${CYAN}2)${NC}  Restore image → USB       ${DIM}(dd, auto-decompression)${NC}"
-    echo -e "    ${MAGENTA}3)${NC}  Clone USB → USB           ${DIM}(direct copy)${NC}"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-3]: " choice
+
+    local choice
+    choice=$(ui_choose "Select operation:" \
+        "Backup USB → image file    (dd, optional compression)" \
+        "Restore image → USB        (dd, auto-decompression)" \
+        "Clone USB → USB            (direct copy)" \
+        "Back")
 
     case "$choice" in
-        1) backup_to_image ;;
-        2) restore_from_image ;;
-        3) clone_usb_to_usb ;;
-        0) return ;;
+        *"Backup"*) backup_to_image ;;
+        *"Restore"*) restore_from_image ;;
+        *"Clone"*) clone_usb_to_usb ;;
+        *) return ;;
         *) echo -e "  ${RED}Invalid choice${NC}" ;;
     esac
 }
@@ -2126,8 +2306,8 @@ write_iso() {
     print_header "Write ISO to USB"
     log "ACTION: Write ISO to USB"
 
-    echo ""
-    read -rep "  Path to ISO file: " iso_file_raw
+    local iso_file_raw
+    iso_file_raw=$(ui_file_input "Select ISO file")
 
     # Validate and expand path
     local iso_file
@@ -2209,14 +2389,12 @@ write_iso() {
     fi
 
     # Verify
-    echo ""
-    echo -e "  ${BOLD}Verify write?${NC}"
-    echo -e "    ${GREEN}1)${NC}  Yes — compare SHA256 checksums ${DIM}(recommended)${NC}"
-    echo -e "    ${CYAN}2)${NC}  No  — skip verification"
-    echo ""
-    read -rp "  Choice [1-2]: " verify
+    local verify
+    verify=$(ui_choose "Verify write?" \
+        "Yes — compare SHA256 checksums (recommended)" \
+        "No — skip verification")
 
-    if [[ "$verify" == "1" || -z "$verify" ]]; then
+    if [[ "$verify" == *"Yes"* || -z "$verify" ]]; then
         if [[ ! "$iso_bytes" =~ ^[0-9]+$ ]] || [[ "$iso_bytes" -eq 0 ]]; then
             print_fail "Cannot determine ISO file size — skipping verification"
         else
@@ -2251,18 +2429,16 @@ write_iso() {
 
 iso_menu() {
     print_header "Category 7: Write ISO (Bootable USB)"
-    echo ""
     echo -e "  ${DIM}  Write bootable ISO images to USB devices.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Write ISO to USB"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-1]: " choice
+
+    local choice
+    choice=$(ui_choose "Select:" \
+        "Write ISO to USB" \
+        "Back")
 
     case "$choice" in
-        1) write_iso ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"Write"*) write_iso ;;
+        *) return ;;
     esac
 }
 
@@ -2393,21 +2569,25 @@ secure_wipe() {
         return
     fi
 
-    echo ""
-    echo -e "  ${BOLD}Wipe method:${NC}"
-    echo -e "    ${GREEN}1)${NC}  Quick wipe     ${DIM}— zero first/last 1MB + wipe signatures (fast)${NC}"
-    echo -e "    ${YELLOW}2)${NC}  Full zero      ${DIM}— write zeros to entire disk${NC}"
-    echo -e "    ${RED}3)${NC}  Random wipe    ${DIM}— write random data to entire disk${NC}"
-    echo -e "    ${MAGENTA}4)${NC}  Multi-pass     ${DIM}— 3 passes: random → zeros → random (slowest)${NC}"
-    echo ""
-    read -rp "  Choice [1-4]: " wipe_mode
+    local wipe_choice
+    wipe_choice=$(ui_choose "Wipe method:" \
+        "Quick wipe — zero first/last 1MB + wipe signatures (fast)" \
+        "Full zero — write zeros to entire disk" \
+        "Random wipe — write random data to entire disk" \
+        "Multi-pass — 3 passes: random → zeros → random (slowest)")
 
-    case "$wipe_mode" in
-        1|2|3|4) ;;
-        *)
-            echo -e "  ${RED}Invalid choice${NC}"
-            return
-            ;;
+    if [[ -z "$wipe_choice" ]]; then
+        echo -e "  ${RED}Invalid choice${NC}"
+        return
+    fi
+
+    local wipe_mode
+    case "$wipe_choice" in
+        *"Quick"*) wipe_mode=1 ;;
+        *"Full zero"*) wipe_mode=2 ;;
+        *"Random"*) wipe_mode=3 ;;
+        *"Multi-pass"*) wipe_mode=4 ;;
+        *) echo -e "  ${RED}Invalid choice${NC}"; return ;;
     esac
 
     if ! double_confirm "$dev"; then
@@ -2434,18 +2614,16 @@ secure_wipe() {
 
 wipe_menu() {
     print_header "Category 8: Secure Wipe"
-    echo ""
     echo -e "  ${DIM}  Securely erase USB drives with various wipe methods.${NC}"
-    echo ""
-    echo -e "    ${GREEN}1)${NC}  Wipe a USB device"
-    echo -e "    ${BLUE}0)${NC}  Back"
-    echo ""
-    read -rp "  Choice [0-1]: " choice
+
+    local choice
+    choice=$(ui_choose "Select:" \
+        "Wipe a USB device" \
+        "Back")
 
     case "$choice" in
-        1) secure_wipe ;;
-        0) return ;;
-        *) echo -e "  ${RED}Invalid choice${NC}" ;;
+        *"Wipe"*) secure_wipe ;;
+        *) return ;;
     esac
 }
 
@@ -2662,15 +2840,32 @@ handle_cli_args() {
 main_menu() {
     while true; do
         clear
-        echo ""
-        echo -e "${BLUE}${BOLD}"
-        echo "  ╔═══════════════════════════════════════════════════════════╗"
-        echo "  ║                                                           ║"
-        echo "  ║             USB TOOLKIT v${SCRIPT_VERSION}                          ║"
-        echo "  ║          Device Operations & Management                   ║"
-        echo "  ║                                                           ║"
-        echo "  ╚═══════════════════════════════════════════════════════════╝"
-        echo -e "${NC}"
+
+        # Banner
+        if [[ "$HAS_GUM" == true ]]; then
+            echo ""
+            gum style \
+                --border "double" \
+                --border-foreground "$GUM_BLUE" \
+                --foreground "$GUM_BLUE" \
+                --bold \
+                --padding "1 4" \
+                --align "center" \
+                --width 60 \
+                "USB TOOLKIT v${SCRIPT_VERSION}" \
+                "Device Operations & Management"
+        else
+            echo ""
+            echo -e "${BLUE}${BOLD}"
+            echo "  ╔═══════════════════════════════════════════════════════════╗"
+            echo "  ║                                                           ║"
+            echo "  ║             USB TOOLKIT v${SCRIPT_VERSION}                          ║"
+            echo "  ║          Device Operations & Management                   ║"
+            echo "  ║                                                           ║"
+            echo "  ╚═══════════════════════════════════════════════════════════╝"
+            echo -e "${NC}"
+        fi
+
         echo -e "  ${DIM}$(date '+%Y-%m-%d %H:%M:%S') | $(hostname) | $(uname -r)${NC}"
 
         # Quick summary of connected USB devices
@@ -2690,51 +2885,43 @@ main_menu() {
                 echo -e "    ${DIM}/dev/${d}  ${sz}  ${mdl}${NC}"
             done
         fi
+        echo ""
 
-        echo ""
-        echo -e "  ${BOLD}Categories:${NC}"
-        echo ""
-        echo -e "    ${GREEN}1)${NC}  USB Detection    ${DIM}— List connected USB storage devices${NC}"
-        echo -e "    ${GREEN}2)${NC}  Mount USB        ${DIM}— Mount USB partitions${NC}"
-        echo -e "    ${GREEN}3)${NC}  Unmount USB      ${DIM}— Safe unmount with sync${NC}"
-        echo -e "    ${YELLOW}4)${NC}  Format USB       ${DIM}— Format with filesystem choice${NC}"
-        echo -e "    ${CYAN}5)${NC}  Health Check     ${DIM}— badblocks, SMART, fsck, speed test${NC}"
-        echo -e "    ${CYAN}6)${NC}  Backup & Clone   ${DIM}— Image backup, restore, clone${NC}"
-        echo -e "    ${MAGENTA}7)${NC}  Write ISO        ${DIM}— Write bootable ISO to USB${NC}"
-        echo -e "    ${RED}8)${NC}  Secure Wipe      ${DIM}— Quick, full, random, multi-pass wipe${NC}"
-        echo ""
-        echo -e "  ${BOLD}Quick Actions:${NC}"
-        echo ""
-        echo -e "    ${GREEN}9)${NC}  Safe Eject       ${DIM}— sync + unmount + power off${NC}"
-        echo -e "    ${CYAN}10)${NC} Device Info       ${DIM}— Quick summary of a USB device${NC}"
-        echo ""
-        echo -e "    ${BLUE}0)${NC}  Exit"
-        echo ""
-        read -rp "  Choice [0-10]: " choice
+        # Main menu selection
+        local choice
+        choice=$(ui_choose "Select operation:" \
+            "USB Detection    — List connected USB storage devices" \
+            "Mount USB        — Mount USB partitions" \
+            "Unmount USB      — Safe unmount with sync" \
+            "Format USB       — Format with filesystem choice" \
+            "Health Check     — badblocks, SMART, fsck, speed test" \
+            "Backup & Clone   — Image backup, restore, clone" \
+            "Write ISO        — Write bootable ISO to USB" \
+            "Secure Wipe      — Quick, full, random, multi-pass wipe" \
+            "Safe Eject       — sync + unmount + power off" \
+            "Device Info      — Quick summary of a USB device" \
+            "Exit")
 
         case "$choice" in
-            1) detect_menu ;;
-            2) mount_menu ;;
-            3) unmount_menu ;;
-            4) format_menu ;;
-            5) health_menu ;;
-            6) backup_menu ;;
-            7) iso_menu ;;
-            8) wipe_menu ;;
-            9) quick_safe_eject ;;
-            10) quick_device_info ;;
-            0)
+            *"USB Detection"*)  detect_menu ;;
+            *"Mount USB"*)      mount_menu ;;
+            *"Unmount USB"*)    unmount_menu ;;
+            *"Format USB"*)     format_menu ;;
+            *"Health Check"*)   health_menu ;;
+            *"Backup & Clone"*) backup_menu ;;
+            *"Write ISO"*)      iso_menu ;;
+            *"Secure Wipe"*)    wipe_menu ;;
+            *"Safe Eject"*)     quick_safe_eject ;;
+            *"Device Info"*)    quick_device_info ;;
+            *"Exit"*)
                 echo ""
                 log "========== USB TOOLKIT EXITED =========="
                 exit 0
                 ;;
-            *)
-                echo -e "  ${RED}Invalid choice${NC}"
-                ;;
+            *) ;;
         esac
 
-        echo ""
-        read -rp "  Press Enter to return to menu... " _
+        ui_pause
     done
 }
 
