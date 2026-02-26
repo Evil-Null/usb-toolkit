@@ -42,4 +42,3 @@ sudo bash usb-toolkit.sh
 
 [MIT](LICENSE)
 
-Made in Georgia.
