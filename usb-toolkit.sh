@@ -2,10 +2,10 @@
 # ============================================================================
 #  USB TOOLKIT
 #  USB Device Operations & Management
-#  Version:  1.0
-#  Date:     2026-02-12
+#  Version:  2.0
+#  Date:     2026-02-24
 #  Tested:   Ubuntu 24.04 / Zorin OS
-#  Usage:    sudo bash usb-toolkit.sh
+#  Usage:    sudo bash usb-toolkit.sh [--help|--version|--list]
 #
 #  8 Categories:
 #    1. USB Detection    — List and identify connected USB storage devices
@@ -29,19 +29,101 @@ set -uo pipefail
 #  Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="2.0"
 readonly LOG_FILE="/var/log/usb-toolkit.log"
+readonly LOCK_FILE="/var/lock/usb-toolkit.lock"
 
-# Colors
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly MAGENTA='\033[0;35m'
-readonly BOLD='\033[1m'
-readonly DIM='\033[2m'
-readonly NC='\033[0m'
+# Cleanup tracking (arrays support multiple resources)
+CLEANUP_TMPFILES=()
+CLEANUP_MOUNTS=()
+
+# TTY detection — disable colors when piped/redirected
+if [[ -t 1 ]]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[1;33m'
+    readonly BLUE='\033[0;34m'
+    readonly CYAN='\033[0;36m'
+    readonly MAGENTA='\033[0;35m'
+    readonly BOLD='\033[1m'
+    readonly DIM='\033[2m'
+    readonly NC='\033[0m'
+else
+    readonly RED=''
+    readonly GREEN=''
+    readonly YELLOW=''
+    readonly BLUE=''
+    readonly CYAN=''
+    readonly MAGENTA=''
+    readonly BOLD=''
+    readonly DIM=''
+    readonly NC=''
+fi
+
+# ============================================================================
+#  Signal Trap & Cleanup
+# ============================================================================
+
+cleanup() {
+    # Remove incomplete temp files
+    for tmpf in "${CLEANUP_TMPFILES[@]}"; do
+        if [[ -n "$tmpf" && -f "$tmpf" ]]; then
+            rm -f "$tmpf" 2>/dev/null
+            log "CLEANUP: Removed incomplete file ${tmpf}"
+        fi
+    done
+    # Unmount temp mounts
+    for mnt in "${CLEANUP_MOUNTS[@]}"; do
+        if [[ -n "$mnt" ]] && findmnt -rn "$mnt" &>/dev/null; then
+            sync
+            umount "$mnt" 2>/dev/null || true
+            rmdir "$mnt" 2>/dev/null || true
+            log "CLEANUP: Unmounted ${mnt}"
+        fi
+    done
+    # Release lockfile
+    release_lock
+    sync 2>/dev/null || true
+}
+
+trap cleanup EXIT
+trap 'echo ""; echo -e "  ${YELLOW}Interrupted.${NC}"; exit 130' INT TERM
+
+# ============================================================================
+#  Lockfile
+# ============================================================================
+
+acquire_lock() {
+    if mkdir "$LOCK_FILE" 2>/dev/null; then
+        # Atomic PID write: write to tmp then rename
+        echo $$ > "${LOCK_FILE}/pid.tmp" && mv "${LOCK_FILE}/pid.tmp" "${LOCK_FILE}/pid"
+        return 0
+    fi
+    # Check for stale lock
+    local lock_pid
+    lock_pid=$(cat "${LOCK_FILE}/pid" 2>/dev/null || echo "")
+    if [[ -z "$lock_pid" ]] || ! kill -0 "$lock_pid" 2>/dev/null; then
+        # Stale lock — previous process died or PID file missing
+        rm -rf "$LOCK_FILE" 2>/dev/null
+        if mkdir "$LOCK_FILE" 2>/dev/null; then
+            echo $$ > "${LOCK_FILE}/pid.tmp" && mv "${LOCK_FILE}/pid.tmp" "${LOCK_FILE}/pid"
+            return 0
+        fi
+    fi
+    echo -e "\n${RED}${BOLD}  ERROR: Another instance is running (PID: ${lock_pid:-unknown}).${NC}"
+    echo -e "${RED}  If this is wrong, remove ${LOCK_FILE} and try again.${NC}\n"
+    return 1
+}
+
+release_lock() {
+    if [[ -d "$LOCK_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(cat "${LOCK_FILE}/pid" 2>/dev/null || echo "")
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -rf "$LOCK_FILE" 2>/dev/null
+        fi
+    fi
+}
 
 # ============================================================================
 #  Helper Functions
@@ -70,10 +152,12 @@ print_fail() {
 
 print_info() {
     echo -e "    ${CYAN}[INFO]${NC}    $1"
+    log "INFO: $1"
 }
 
 print_warn() {
     echo -e "    ${YELLOW}[WARN]${NC}    $1"
+    log "WARN: $1"
 }
 
 print_header() {
@@ -89,6 +173,160 @@ print_section() {
     echo -e "  ${CYAN}  ─────────────────────────────────────────────────${NC}"
 }
 
+# ============================================================================
+#  Input Validation
+# ============================================================================
+
+validate_volume_label() {
+    local label="$1"
+    local fs_type="${2:-}"
+
+    if [[ -z "$label" ]]; then
+        return 0
+    fi
+
+    # Only allow safe characters: alphanumeric, space, underscore, hyphen, dot
+    if [[ ! "$label" =~ ^[a-zA-Z0-9\ _\.\-]+$ ]]; then
+        print_fail "Invalid volume label: only [a-zA-Z0-9 _.-] allowed"
+        return 1
+    fi
+
+    # FAT32: max 11 characters
+    if [[ "$fs_type" == "fat32" || "$fs_type" == "vfat" ]] && [[ ${#label} -gt 11 ]]; then
+        print_fail "FAT32 volume label max 11 characters (got ${#label})"
+        return 1
+    fi
+
+    return 0
+}
+
+validate_mount_options() {
+    local opts="$1"
+
+    if [[ -z "$opts" ]]; then
+        return 0
+    fi
+
+    # Only allow safe characters: alphanumeric, comma, equals, underscore
+    if [[ ! "$opts" =~ ^[a-zA-Z0-9,=_]+$ ]]; then
+        print_fail "Invalid mount options: only [a-zA-Z0-9,=_] allowed"
+        return 1
+    fi
+
+    return 0
+}
+
+validate_filepath() {
+    local path="$1"
+
+    if [[ -z "$path" ]]; then
+        return 1
+    fi
+
+    # Expand tilde using actual home directory (handles root, LDAP, etc.)
+    local tilde="~"
+    if [[ "$path" == "${tilde}/"* || "$path" == "${tilde}" ]]; then
+        local home_dir
+        home_dir=$(get_user_home)
+        if [[ "$path" == "${tilde}" ]]; then
+            path="$home_dir"
+        else
+            path="${home_dir}/${path:2}"
+        fi
+    fi
+
+    # Reject shell metacharacters
+    if [[ "$path" =~ [\;\|\&\$\`\(\)\{\}\<\>\\!\#\?\*\[] ]]; then
+        print_fail "Invalid path: shell metacharacters not allowed"
+        return 1
+    fi
+
+    echo "$path"
+    return 0
+}
+
+# ============================================================================
+#  Operation Timer
+# ============================================================================
+
+TIMER_START=0
+
+timer_start() {
+    TIMER_START=$(date +%s)
+}
+
+timer_stop() {
+    local label="${1:-Operation}"
+    local end
+    end=$(date +%s)
+    local elapsed=$((end - TIMER_START))
+    local mins=$((elapsed / 60))
+    local secs=$((elapsed % 60))
+    if [[ $mins -gt 0 ]]; then
+        print_info "${label} completed in ${mins}m ${secs}s"
+    else
+        print_info "${label} completed in ${secs}s"
+    fi
+}
+
+# ============================================================================
+#  Sysfs Helper
+# ============================================================================
+
+read_sysfs() {
+    local path="$1"
+    local default="${2:-}"
+    local value
+    if [[ -f "$path" ]]; then
+        value=$(< "$path")
+        # Trim whitespace
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+    echo "$default"
+    return 1
+}
+
+# ============================================================================
+#  dd with progress (pv integration)
+# ============================================================================
+
+dd_with_progress() {
+    local input="$1"
+    local output="$2"
+    local bs="${3:-4M}"
+    local extra_args=("${@:4}")
+
+    if command -v pv &>/dev/null; then
+        local size=""
+        if [[ -b "$input" ]]; then
+            size=$(blockdev --getsize64 "$input" 2>/dev/null || echo "")
+        elif [[ -f "$input" ]]; then
+            size=$(stat -c%s "$input" 2>/dev/null || echo "")
+        fi
+        local pv_args=()
+        [[ -n "$size" ]] && pv_args+=("-s" "$size")
+        dd if="$input" bs="$bs" 2>/dev/null | pv "${pv_args[@]}" | dd of="$output" bs="$bs" "${extra_args[@]}" 2>/dev/null
+        # Check all pipeline stages — any failure = overall failure
+        local pipe_statuses=("${PIPESTATUS[@]}")
+        for s in "${pipe_statuses[@]}"; do
+            [[ "$s" -ne 0 ]] && return 1
+        done
+        return 0
+    else
+        dd if="$input" of="$output" bs="$bs" status=progress "${extra_args[@]}" 2>&1
+        return $?
+    fi
+}
+
+# ============================================================================
+#  UI Helpers
+# ============================================================================
+
 confirm_action() {
     local msg="$1"
     echo ""
@@ -98,18 +336,54 @@ confirm_action() {
 
 double_confirm() {
     local device="$1"
+    local dev_display="/dev/${device}"
+    local model size
+    model=$(read_sysfs "/sys/block/${device}/device/model" || echo "")
+    size=$(lsblk -dnro SIZE "/dev/${device}" 2>/dev/null || echo "?")
+    # Dynamic width based on content — ensure minimum 52 cols
+    local inner_text="ALL DATA ON ${dev_display} WILL BE DESTROYED!"
+    local title="*** DESTRUCTIVE OPERATION ***"
+    local text_len=${#inner_text}
+    local title_len=${#title}
+    local min_content=$(( text_len > title_len ? text_len : title_len ))
+    local box_width=$(( min_content + 8 ))
+    [[ $box_width -lt 52 ]] && box_width=52
+    local pad_total=$((box_width - text_len - 2))
+    local pad_left=$((pad_total / 2))
+    local pad_right=$((pad_total - pad_left))
+    local border_inner=""
+    local title_pad_total=$((box_width - title_len - 2))
+    local title_pad_left=$((title_pad_total / 2))
+    local title_pad_right=$((title_pad_total - title_pad_left))
+
+    printf -v border_inner '%*s' "$((box_width - 2))" ''
+    border_inner="${border_inner// /═}"
+
     echo ""
-    echo -e "  ${RED}${BOLD}  ╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "  ${RED}${BOLD}  ║          *** DESTRUCTIVE OPERATION ***           ║${NC}"
-    echo -e "  ${RED}${BOLD}  ║   ALL DATA ON ${device} WILL BE DESTROYED!   ║${NC}"
-    echo -e "  ${RED}${BOLD}  ╚══════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${RED}${BOLD}  ╔${border_inner}╗${NC}"
+    printf "  %b  ║%*s%s%*s║%b\n" "${RED}${BOLD}" "$title_pad_left" "" "$title" "$title_pad_right" "" "${NC}"
+    printf "  %b  ║%*s%s%*s║%b\n" "${RED}${BOLD}" "$pad_left" "" "$inner_text" "$pad_right" "" "${NC}"
+    echo -e "  ${RED}${BOLD}  ╚${border_inner}╝${NC}"
+    [[ -n "$model" ]] && echo -e "  ${RED}  Device: ${model} (${size})${NC}"
     echo ""
-    read -rp "  Type the device name (e.g. ${device}) to confirm: " typed
-    [[ "$typed" == "$device" ]]
+    echo -e "  ${YELLOW}  Type '${BOLD}${device}${NC}${YELLOW}' to confirm:${NC}"
+    read -rp "  > " typed
+    if [[ "$typed" != "$device" ]]; then
+        echo -e "  ${RED}  Input '${typed}' does not match '${device}' — cancelled.${NC}"
+        return 1
+    fi
+    return 0
 }
 
 get_current_user() {
-    logname 2>/dev/null || echo "${SUDO_USER:-root}"
+    logname 2>/dev/null || echo "${SUDO_USER:-$(whoami)}"
+}
+
+# Get actual home directory for a user (handles root=/root, LDAP, etc.)
+get_user_home() {
+    local user
+    user=$(get_current_user)
+    getent passwd "$user" 2>/dev/null | cut -d: -f6 || echo "${HOME:-/root}"
 }
 
 check_root() {
@@ -118,8 +392,11 @@ check_root() {
         echo -e "${RED}  Run: sudo bash $0${NC}\n"
         exit 1
     fi
-    touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || true
-    log "========== USB TOOLKIT v${SCRIPT_VERSION} STARTED =========="
+    if touch "$LOG_FILE" 2>/dev/null; then
+        chmod 600 "$LOG_FILE" 2>/dev/null
+    else
+        echo -e "  ${DIM}  Note: Cannot write to ${LOG_FILE} — logging disabled${NC}"
+    fi
 }
 
 check_dependencies() {
@@ -141,7 +418,7 @@ check_dependencies() {
     fi
 
     # Optional tools
-    local optional=("pv" "smartctl" "badblocks" "ntfs-3g" "mkfs.exfat" "mkfs.btrfs")
+    local optional=("pv" "smartctl" "badblocks" "ntfs-3g" "mkfs.exfat" "mkfs.btrfs" "mkfs.f2fs" "mkfs.xfs" "zstd")
     for cmd in "${optional[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
             optional_missing+=("$cmd")
@@ -158,33 +435,98 @@ check_dependencies() {
 #  USB Device Discovery Helpers
 # ============================================================================
 
-# Get list of USB block devices (whole disks only, e.g. sdb, sdc)
+# Get USB bus speed for a device
+get_usb_speed() {
+    local dev="$1"
+    local speed_file=""
+
+    # Walk sysfs to find the USB speed attribute
+    local device_path
+    device_path=$(readlink -f "/sys/block/${dev}/device" 2>/dev/null || echo "")
+    if [[ -z "$device_path" ]]; then
+        echo "Unknown"
+        return
+    fi
+
+    # Walk up the device tree to find the USB device with speed attribute
+    local path="$device_path"
+    while [[ "$path" != "/" ]]; do
+        if [[ -f "${path}/speed" ]]; then
+            speed_file="${path}/speed"
+            break
+        fi
+        path=$(dirname "$path")
+    done
+
+    if [[ -z "$speed_file" ]]; then
+        echo "Unknown"
+        return
+    fi
+
+    local speed
+    speed=$(read_sysfs "$speed_file" "0")
+
+    case "$speed" in
+        1.5)   echo "USB 1.0 (1.5 Mbps)" ;;
+        12)    echo "USB 1.1 (12 Mbps)" ;;
+        480)   echo "USB 2.0 (480 Mbps)" ;;
+        5000)  echo "USB 3.0 (5 Gbps)" ;;
+        10000) echo "USB 3.1 (10 Gbps)" ;;
+        20000) echo "USB 3.2 (20 Gbps)" ;;
+        *)     echo "USB (${speed} Mbps)" ;;
+    esac
+}
+
+# Get list of USB block devices (whole disks only, e.g. sdb, sdc, nvme0n1)
 get_usb_devices() {
     local devices=()
+
+    # Traditional sd* devices
     for block in /sys/block/sd*; do
         [[ ! -d "$block" ]] && continue
         local dev_name
         dev_name=$(basename "$block")
-        # Check if removable
         local removable
-        removable=$(cat "${block}/removable" 2>/dev/null || echo "0")
-        # Also check if it's on USB bus
+        removable=$(read_sysfs "${block}/removable" "0")
         if [[ "$removable" == "1" ]] || readlink -f "${block}/device" 2>/dev/null | grep -q "usb"; then
             devices+=("$dev_name")
         fi
     done
+
+    # NVMe USB enclosures
+    for block in /sys/block/nvme*; do
+        [[ ! -d "$block" ]] && continue
+        local dev_name
+        dev_name=$(basename "$block")
+        # Check if this NVMe is on USB bus
+        if readlink -f "${block}/device" 2>/dev/null | grep -q "usb"; then
+            devices+=("$dev_name")
+        fi
+    done
+
     echo "${devices[@]}"
 }
 
-# Get USB partitions (e.g. sdb1, sdc1)
+# Get partition name for a device (handles NVMe p1 vs sd 1 naming)
+get_partition_pattern() {
+    local dev="$1"
+    if [[ "$dev" == nvme* ]]; then
+        echo "${dev}p"
+    else
+        echo "${dev}"
+    fi
+}
+
+# Get USB partitions (e.g. sdb1, sdc1, nvme0n1p1)
 get_usb_partitions() {
     local partitions=()
     local usb_devs
     usb_devs=$(get_usb_devices)
     for dev in $usb_devs; do
-        # Add whole device if it has no partitions
         local has_parts=0
-        for part in /sys/block/"${dev}"/"${dev}"[0-9]*; do
+        local part_prefix
+        part_prefix=$(get_partition_pattern "$dev")
+        for part in /sys/block/"${dev}"/"${part_prefix}"[0-9]*; do
             [[ ! -d "$part" ]] && continue
             has_parts=1
             partitions+=("$(basename "$part")")
@@ -222,14 +564,15 @@ get_mounted_usb_partitions() {
     echo "${mounted[@]}"
 }
 
-# Interactive device selection — returns selected device in $SELECTED_DEV
-# Args: $1 = device list (space-separated), $2 = prompt label
-SELECTED_DEV=""
+# Interactive device selection — returns selected device via nameref
+# Args: $1 = device list (space-separated), $2 = prompt label, $3 = nameref variable name
 select_device() {
-    local dev_list=($1)
+    local -a dev_list
+    read -ra dev_list <<< "$1"
     local label="$2"
+    local -n _result_var="$3"
 
-    SELECTED_DEV=""
+    _result_var=""
 
     if [[ ${#dev_list[@]} -eq 0 ]]; then
         print_info "No ${label} found."
@@ -248,10 +591,10 @@ select_device() {
         fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "")
         label_name=$(blkid -o value -s LABEL "/dev/${dev}" 2>/dev/null || echo "")
 
-        printf "    ${GREEN}%2d)${NC}  /dev/%-8s  ${BOLD}%6s${NC}" "$i" "$dev" "$size"
-        [[ -n "$fstype" ]] && printf "  ${DIM}[%s]${NC}" "$fstype"
-        [[ -n "$label_name" ]] && printf "  ${CYAN}%s${NC}" "$label_name"
-        [[ -n "$model" ]] && printf "  ${DIM}%s${NC}" "$model"
+        printf "    %b%2d)%b  /dev/%-8s  %b%6s%b" "${GREEN}" "$i" "${NC}" "$dev" "${BOLD}" "$size" "${NC}"
+        [[ -n "$fstype" ]] && printf "  %b[%s]%b" "${DIM}" "$fstype" "${NC}"
+        [[ -n "$label_name" ]] && printf "  %b%s%b" "${CYAN}" "$label_name" "${NC}"
+        [[ -n "$model" ]] && printf "  %b%s%b" "${DIM}" "$model" "${NC}"
         echo ""
         i=$((i + 1))
     done
@@ -264,7 +607,13 @@ select_device() {
     fi
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#dev_list[@]} ]]; then
-        SELECTED_DEV="${dev_list[$((choice - 1))]}"
+        local selected="${dev_list[$((choice - 1))]}"
+        # Verify device still exists (may have been removed while user was choosing)
+        if [[ ! -b "/dev/${selected}" ]]; then
+            echo -e "  ${RED}/dev/${selected} no longer exists — device may have been removed${NC}"
+            return 1
+        fi
+        _result_var="$selected"
         return 0
     fi
 
@@ -272,21 +621,165 @@ select_device() {
     return 1
 }
 
-# Check device is not a system disk
+# Unmount all partitions of a device. Returns 1 if any unmount fails.
+# Also prevents TOCTOU race with desktop automount (GNOME/KDE).
+unmount_all_partitions() {
+    local dev="$1"
+    local force="${2:-false}"
+    local failed=0
+
+    # Disable automount temporarily (prevents GNOME/KDE from re-mounting)
+    if command -v udevadm &>/dev/null; then
+        udevadm lock --device="/dev/${dev}" --timeout=0 2>/dev/null || true
+    fi
+
+    for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
+        if findmnt -rn "/dev/${part}" &>/dev/null; then
+            sync
+            if ! umount "/dev/${part}" 2>/dev/null; then
+                if [[ "$force" == "true" ]]; then
+                    umount -l "/dev/${part}" 2>/dev/null || true
+                    print_warn "Lazy unmounted /dev/${part}"
+                else
+                    print_fail "Could not unmount /dev/${part} — device busy"
+                    failed=1
+                fi
+            else
+                print_ok "Unmounted /dev/${part}"
+            fi
+        fi
+    done
+
+    # Verify nothing got re-mounted (TOCTOU check)
+    if [[ $failed -eq 0 ]]; then
+        for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
+            if findmnt -rn "/dev/${part}" &>/dev/null; then
+                print_fail "/dev/${part} was re-mounted by system (automount race)"
+                failed=1
+            fi
+        done
+    fi
+
+    return $failed
+}
+
+# Check device is not a system disk.
+# Handles LVM, dm-crypt, btrfs subvolumes, and standard partitions.
 is_system_disk() {
     local dev="$1"
-    # Strip partition number to get base device
-    local base_dev
-    base_dev=$(echo "$dev" | sed 's/[0-9]*$//')
 
-    # Check if root filesystem is on this device
-    local root_dev
-    root_dev=$(findmnt -rno SOURCE / 2>/dev/null | sed 's/[0-9]*$//' | sed 's|/dev/||')
-
-    if [[ "$base_dev" == "$root_dev" ]]; then
-        return 0  # IS system disk
+    # Method 1: Use lsblk PKNAME to walk parent chain from root device
+    local root_source
+    root_source=$(findmnt -rno SOURCE / 2>/dev/null)
+    if [[ -n "$root_source" ]]; then
+        # For LVM/dm-crypt: resolve to physical device via lsblk slaves
+        local root_base
+        root_base=$(lsblk -ndo PKNAME "$root_source" 2>/dev/null)
+        # Walk up if PKNAME itself has a parent (e.g. dm → partition → disk)
+        while [[ -n "$root_base" ]]; do
+            local parent
+            parent=$(lsblk -ndo PKNAME "/dev/${root_base}" 2>/dev/null)
+            if [[ -n "$parent" && "$parent" != "$root_base" ]]; then
+                root_base="$parent"
+            else
+                break
+            fi
+        done
+        # If we couldn't resolve, fall back to sed method
+        if [[ -z "$root_base" ]]; then
+            root_base=$(echo "$root_source" | sed -e 's|/dev/||' -e 's/p[0-9]*$//' -e 's/[0-9]*$//')
+        fi
+        if [[ "$dev" == "$root_base" ]]; then
+            return 0  # IS system disk
+        fi
     fi
+
+    # Method 2: Check if any partition on this device holds a critical mount
+    local critical_mounts=("/" "/boot" "/boot/efi" "/home" "/var")
+    for mnt in "${critical_mounts[@]}"; do
+        local mnt_source
+        mnt_source=$(findmnt -rno SOURCE "$mnt" 2>/dev/null)
+        [[ -z "$mnt_source" ]] && continue
+        if echo "$mnt_source" | grep -q "/dev/${dev}"; then
+            return 0  # IS system disk
+        fi
+    done
+
     return 1  # NOT system disk
+}
+
+# ============================================================================
+#  Device Details (shared between detect and device_info)
+# ============================================================================
+
+# Walk up sysfs tree to find a USB attribute (handles UAS, NVMe-over-USB, etc.)
+find_usb_attr() {
+    local dev="$1"
+    local attr="$2"
+    local default="${3:-}"
+    local path
+    path=$(readlink -f "/sys/block/${dev}/device" 2>/dev/null || echo "")
+    while [[ -n "$path" && "$path" != "/" ]]; do
+        if [[ -f "${path}/${attr}" ]]; then
+            read_sysfs "${path}/${attr}" "$default"
+            return 0
+        fi
+        path=$(dirname "$path")
+    done
+    echo "$default"
+    return 1
+}
+
+print_device_details() {
+    local dev="$1"
+
+    local size model serial vendor_id product_id removable manufacturer usb_speed
+    size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "Unknown")
+    model=$(read_sysfs "/sys/block/${dev}/device/model" "Unknown")
+    serial=$(find_usb_attr "$dev" "serial" "N/A")
+    vendor_id=$(find_usb_attr "$dev" "idVendor" "????")
+    product_id=$(find_usb_attr "$dev" "idProduct" "????")
+    removable=$(read_sysfs "/sys/block/${dev}/removable" "?")
+    manufacturer=$(read_sysfs "/sys/block/${dev}/device/../../manufacturer" "Unknown")
+    usb_speed=$(get_usb_speed "$dev")
+
+    echo -e "    ${BOLD}${GREEN}/dev/${dev}${NC}  —  ${BOLD}${size}${NC}  ${DIM}[${vendor_id}:${product_id}]${NC}"
+    echo -e "      ${DIM}Model:        ${model}${NC}"
+    echo -e "      ${DIM}Manufacturer: ${manufacturer}${NC}"
+    echo -e "      ${DIM}Serial:       ${serial}${NC}"
+    echo -e "      ${DIM}Removable:    ${removable}${NC}"
+    echo -e "      ${DIM}USB Speed:    ${usb_speed}${NC}"
+}
+
+print_device_partitions() {
+    local dev="$1"
+    local part_prefix
+    part_prefix=$(get_partition_pattern "$dev")
+
+    local has_parts=0
+    for part in /sys/block/"${dev}"/"${part_prefix}"[0-9]*; do
+        [[ ! -d "$part" ]] && continue
+        has_parts=1
+        local part_name
+        part_name=$(basename "$part")
+        local psize fstype plabel mountpoint
+        psize=$(lsblk -dnro SIZE "/dev/${part_name}" 2>/dev/null || echo "?")
+        fstype=$(blkid -o value -s TYPE "/dev/${part_name}" 2>/dev/null || echo "unknown")
+        plabel=$(blkid -o value -s LABEL "/dev/${part_name}" 2>/dev/null || echo "")
+        mountpoint=$(findmnt -rno TARGET "/dev/${part_name}" 2>/dev/null || echo "not mounted")
+
+        printf "      %b├─ %-8s%b  %6s  [%s]" "${CYAN}" "$part_name" "${NC}" "$psize" "$fstype"
+        [[ -n "$plabel" ]] && printf "  label=\"%s\"" "$plabel"
+        echo ""
+        echo -e "      ${DIM}│  Mount: ${mountpoint}${NC}"
+    done
+
+    if [[ $has_parts -eq 0 ]]; then
+        local fstype mountpoint
+        fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "no filesystem")
+        mountpoint=$(findmnt -rno TARGET "/dev/${dev}" 2>/dev/null || echo "not mounted")
+        echo -e "      ${CYAN}└─ No partitions${NC}  [${fstype}]  Mount: ${mountpoint}"
+    fi
 }
 
 # ============================================================================
@@ -308,45 +801,8 @@ detect_list_devices() {
 
     for dev in $usb_devs; do
         echo ""
-        local size model serial vendor_id product_id
-        size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "Unknown")
-        model=$(cat "/sys/block/${dev}/device/model" 2>/dev/null | xargs || echo "Unknown")
-        serial=$(cat "/sys/block/${dev}/device/../../serial" 2>/dev/null | xargs || echo "N/A")
-        vendor_id=$(cat "/sys/block/${dev}/device/../../idVendor" 2>/dev/null || echo "????")
-        product_id=$(cat "/sys/block/${dev}/device/../../idProduct" 2>/dev/null || echo "????")
-        local removable
-        removable=$(cat "/sys/block/${dev}/removable" 2>/dev/null || echo "?")
-
-        echo -e "    ${BOLD}${GREEN}/dev/${dev}${NC}  —  ${BOLD}${size}${NC}  ${DIM}[${vendor_id}:${product_id}]${NC}"
-        echo -e "      ${DIM}Model:   ${model}${NC}"
-        echo -e "      ${DIM}Serial:  ${serial}${NC}"
-        echo -e "      ${DIM}Removable: ${removable}${NC}"
-
-        # Show partitions
-        local has_parts=0
-        for part in /sys/block/"${dev}"/"${dev}"[0-9]*; do
-            [[ ! -d "$part" ]] && continue
-            has_parts=1
-            local part_name
-            part_name=$(basename "$part")
-            local psize fstype plabel mountpoint
-            psize=$(lsblk -dnro SIZE "/dev/${part_name}" 2>/dev/null || echo "?")
-            fstype=$(blkid -o value -s TYPE "/dev/${part_name}" 2>/dev/null || echo "unknown")
-            plabel=$(blkid -o value -s LABEL "/dev/${part_name}" 2>/dev/null || echo "")
-            mountpoint=$(findmnt -rno TARGET "/dev/${part_name}" 2>/dev/null || echo "not mounted")
-
-            printf "      ${CYAN}├─ %-8s${NC}  %6s  [%s]" "$part_name" "$psize" "$fstype"
-            [[ -n "$plabel" ]] && printf "  label=\"%s\"" "$plabel"
-            echo ""
-            echo -e "      ${DIM}│  Mount: ${mountpoint}${NC}"
-        done
-
-        if [[ $has_parts -eq 0 ]]; then
-            local fstype mountpoint
-            fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "no filesystem")
-            mountpoint=$(findmnt -rno TARGET "/dev/${dev}" 2>/dev/null || echo "not mounted")
-            echo -e "      ${CYAN}└─ No partitions${NC}  [${fstype}]  Mount: ${mountpoint}"
-        fi
+        print_device_details "$dev"
+        print_device_partitions "$dev"
     done
     echo ""
 }
@@ -380,11 +836,11 @@ mount_usb() {
     local unmounted
     unmounted=$(get_unmounted_usb_partitions)
 
-    if ! select_device "$unmounted" "unmounted USB partitions"; then
+    local dev=""
+    if ! select_device "$unmounted" "unmounted USB partitions" dev; then
         return
     fi
 
-    local dev="$SELECTED_DEV"
     local fstype
     fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "")
     local dev_label
@@ -405,14 +861,17 @@ mount_usb() {
     echo ""
     read -rp "  Choice [1-4]: " mode
 
-    local mount_opts=""
+    local -a mount_args=()
     case "$mode" in
-        1|"") mount_opts="" ;;
-        2) mount_opts="-o ro" ;;
-        3) mount_opts="-o noexec,sync" ;;
+        1|"") ;;
+        2) mount_args+=("-o" "ro") ;;
+        3) mount_args+=("-o" "noexec,sync") ;;
         4)
             read -rp "  Enter mount options (e.g. ro,noexec,sync): " custom_opts
-            mount_opts="-o ${custom_opts}"
+            if ! validate_mount_options "$custom_opts"; then
+                return
+            fi
+            mount_args+=("-o" "${custom_opts}")
             ;;
         *)
             echo -e "  ${RED}Invalid choice${NC}"
@@ -428,30 +887,39 @@ mount_usb() {
     read -rp "  Mount point [${default_mount}]: " custom_mount
     local mount_point="${custom_mount:-$default_mount}"
 
+    # Validate mount point — reject shell metacharacters
+    if [[ -n "$custom_mount" ]]; then
+        if [[ "$custom_mount" =~ [';|&$`(){}< >\\!#?*\['] ]]; then
+            print_fail "Mount point contains invalid characters"
+            return
+        fi
+        # Expand tilde
+        mount_point="${mount_point/#\~//home/${user}}"
+    fi
+
     # Create mount point
     mkdir -p "$mount_point"
 
     # Determine filesystem options
-    local fs_opts=""
     if [[ "$fstype" == "vfat" || "$fstype" == "exfat" ]]; then
         local uid gid
         uid=$(id -u "$user" 2>/dev/null || echo "1000")
         gid=$(id -g "$user" 2>/dev/null || echo "1000")
-        if [[ -n "$mount_opts" ]]; then
-            mount_opts="${mount_opts},uid=${uid},gid=${gid}"
+        if [[ ${#mount_args[@]} -gt 0 ]]; then
+            # Append to existing -o value
+            mount_args[-1]="${mount_args[-1]},uid=${uid},gid=${gid}"
         else
-            mount_opts="-o uid=${uid},gid=${gid}"
+            mount_args+=("-o" "uid=${uid},gid=${gid}")
         fi
     fi
 
-    # Mount
-    local mount_cmd="mount"
-    [[ -n "$mount_opts" ]] && mount_cmd="mount ${mount_opts}"
-    [[ -n "$fstype" ]] && mount_cmd="${mount_cmd} -t ${fstype}"
+    # Add filesystem type if known
+    [[ -n "$fstype" ]] && mount_args+=("-t" "$fstype")
 
-    if eval "${mount_cmd} /dev/${dev} '${mount_point}'" 2>/dev/null; then
+    # Mount — array-based, no eval
+    if mount "${mount_args[@]}" "/dev/${dev}" "$mount_point" 2>/dev/null; then
         print_ok "Mounted /dev/${dev} → ${mount_point}"
-        log "MOUNT: /dev/${dev} → ${mount_point} [opts: ${mount_opts}]"
+        log "MOUNT: /dev/${dev} → ${mount_point} [opts: ${mount_args[*]}]"
         # Fix permissions for user
         if [[ "$fstype" != "vfat" && "$fstype" != "exfat" && "$fstype" != "ntfs" ]]; then
             chown "${user}:${user}" "$mount_point" 2>/dev/null || true
@@ -518,11 +986,11 @@ unmount_usb() {
     local mounted
     mounted=$(get_mounted_usb_partitions)
 
-    if ! select_device "$mounted" "mounted USB partitions"; then
+    local dev=""
+    if ! select_device "$mounted" "mounted USB partitions" dev; then
         return
     fi
 
-    local dev="$SELECTED_DEV"
     local mount_point
     mount_point=$(findmnt -rno TARGET "/dev/${dev}" 2>/dev/null)
 
@@ -534,19 +1002,23 @@ unmount_usb() {
     echo -e "  ${BOLD}Unmount mode:${NC}"
     echo -e "    ${GREEN}1)${NC}  Safe unmount ${DIM}(sync then umount)${NC}"
     echo -e "    ${YELLOW}2)${NC}  Force unmount ${DIM}(umount -f — for busy devices)${NC}"
-    echo -e "    ${CYAN}3)${NC}  Show processes using this device"
+    echo -e "    ${MAGENTA}3)${NC}  Lazy unmount  ${DIM}(umount -l — detach now, clean up later)${NC}"
+    echo -e "    ${CYAN}4)${NC}  Show processes using this device"
     echo ""
-    read -rp "  Choice [1-3]: " mode
+    read -rp "  Choice [1-4]: " mode
 
     case "$mode" in
         1)
             print_info "Syncing filesystem..."
             sync
-            if umount "/dev/${dev}" 2>/dev/null; then
+            # Unmount by mount point (more reliable than device path for bind mounts)
+            if [[ -n "$mount_point" ]] && umount "$mount_point" 2>/dev/null; then
                 print_ok "Unmounted /dev/${dev} from ${mount_point}"
                 log "UNMOUNT: /dev/${dev} from ${mount_point}"
-                # Clean up empty mount point
                 rmdir "$mount_point" 2>/dev/null || true
+            elif umount "/dev/${dev}" 2>/dev/null; then
+                print_ok "Unmounted /dev/${dev}"
+                log "UNMOUNT: /dev/${dev}"
             else
                 print_fail "Could not unmount /dev/${dev} — device may be busy"
                 unmount_show_processes "$dev" "$mount_point"
@@ -555,16 +1027,33 @@ unmount_usb() {
         2)
             print_warn "Force unmounting /dev/${dev}..."
             sync
-            if umount -f "/dev/${dev}" 2>/dev/null; then
-                print_ok "Force unmounted /dev/${dev}"
+            if [[ -n "$mount_point" ]] && umount -f "$mount_point" 2>/dev/null; then
+                print_ok "Force unmounted /dev/${dev} from ${mount_point}"
                 log "UNMOUNT (force): /dev/${dev} from ${mount_point}"
                 rmdir "$mount_point" 2>/dev/null || true
+            elif umount -f "/dev/${dev}" 2>/dev/null; then
+                print_ok "Force unmounted /dev/${dev}"
+                log "UNMOUNT (force): /dev/${dev}"
             else
                 print_fail "Force unmount failed"
-                print_info "Try: umount -l /dev/${dev} (lazy unmount)"
+                print_info "Try lazy unmount (option 3)"
             fi
             ;;
         3)
+            print_warn "Lazy unmounting /dev/${dev}..."
+            sync
+            if [[ -n "$mount_point" ]] && umount -l "$mount_point" 2>/dev/null; then
+                print_ok "Lazy unmounted /dev/${dev} from ${mount_point}"
+                log "UNMOUNT (lazy): /dev/${dev} from ${mount_point}"
+                rmdir "$mount_point" 2>/dev/null || true
+            elif umount -l "/dev/${dev}" 2>/dev/null; then
+                print_ok "Lazy unmounted /dev/${dev}"
+                log "UNMOUNT (lazy): /dev/${dev}"
+            else
+                print_fail "Lazy unmount failed"
+            fi
+            ;;
+        4)
             unmount_show_processes "$dev" "$mount_point"
             ;;
         *)
@@ -603,11 +1092,10 @@ format_usb() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     # Safety check — don't format system disk
     if is_system_disk "$dev"; then
@@ -635,11 +1123,10 @@ format_usb() {
             return
         fi
         # Unmount all
-        for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
-            sync
-            umount "/dev/${part}" 2>/dev/null || true
-        done
-        print_ok "All partitions unmounted"
+        if ! unmount_all_partitions "$dev"; then
+            print_fail "Could not unmount all partitions — aborting"
+            return
+        fi
     fi
 
     # Partition table
@@ -665,14 +1152,17 @@ format_usb() {
     echo -e "    ${MAGENTA}3)${NC}  NTFS    ${DIM}— Windows compatible, large files${NC}"
     echo -e "    ${YELLOW}4)${NC}  ext4    ${DIM}— Linux native, journaled${NC}"
     echo -e "    ${BLUE}5)${NC}  Btrfs   ${DIM}— Linux, COW, snapshots${NC}"
+    echo -e "    ${GREEN}6)${NC}  F2FS    ${DIM}— Flash-Friendly FS (USB/SD optimized)${NC}"
+    echo -e "    ${CYAN}7)${NC}  XFS     ${DIM}— High-performance journaling${NC}"
     echo ""
-    read -rp "  Choice [1-5]: " fs_choice
+    read -rp "  Choice [1-7]: " fs_choice
 
-    local fs_type="" mkfs_cmd=""
+    local fs_type=""
+    local -a mkfs_args=()
     case "$fs_choice" in
         1|"")
             fs_type="fat32"
-            mkfs_cmd="mkfs.vfat -F 32"
+            mkfs_args=("mkfs.vfat" "-F" "32")
             ;;
         2)
             if ! command -v mkfs.exfat &>/dev/null; then
@@ -680,7 +1170,7 @@ format_usb() {
                 return
             fi
             fs_type="exfat"
-            mkfs_cmd="mkfs.exfat"
+            mkfs_args=("mkfs.exfat")
             ;;
         3)
             if ! command -v mkfs.ntfs &>/dev/null; then
@@ -688,11 +1178,11 @@ format_usb() {
                 return
             fi
             fs_type="ntfs"
-            mkfs_cmd="mkfs.ntfs -f"
+            mkfs_args=("mkfs.ntfs" "-f")
             ;;
         4)
             fs_type="ext4"
-            mkfs_cmd="mkfs.ext4 -F"
+            mkfs_args=("mkfs.ext4" "-F")
             ;;
         5)
             if ! command -v mkfs.btrfs &>/dev/null; then
@@ -700,7 +1190,23 @@ format_usb() {
                 return
             fi
             fs_type="btrfs"
-            mkfs_cmd="mkfs.btrfs -f"
+            mkfs_args=("mkfs.btrfs" "-f")
+            ;;
+        6)
+            if ! command -v mkfs.f2fs &>/dev/null; then
+                print_fail "mkfs.f2fs not found. Install: sudo apt install f2fs-tools"
+                return
+            fi
+            fs_type="f2fs"
+            mkfs_args=("mkfs.f2fs" "-f")
+            ;;
+        7)
+            if ! command -v mkfs.xfs &>/dev/null; then
+                print_fail "mkfs.xfs not found. Install: sudo apt install xfsprogs"
+                return
+            fi
+            fs_type="xfs"
+            mkfs_args=("mkfs.xfs" "-f")
             ;;
         *)
             echo -e "  ${RED}Invalid choice${NC}"
@@ -711,6 +1217,12 @@ format_usb() {
     # Volume label
     echo ""
     read -rp "  Volume label (leave empty for none): " vol_label
+
+    if [[ -n "$vol_label" ]]; then
+        if ! validate_volume_label "$vol_label" "$fs_type"; then
+            return
+        fi
+    fi
 
     # Format type
     echo ""
@@ -735,61 +1247,96 @@ format_usb() {
     fi
 
     log "FORMAT: /dev/${dev} pt=${pt_type} fs=${fs_type} label=${vol_label}"
+    timer_start
 
     # Full format — zero disk first
     if [[ "$fmt_mode" == "2" ]]; then
         print_info "Zeroing disk (this may take a while)..."
-        dd if=/dev/zero of="/dev/${dev}" bs=4M status=progress 2>&1 || true
+        dd_with_progress "/dev/zero" "/dev/${dev}" "4M" || true
         sync
         print_ok "Disk zeroed"
     fi
 
+    # Wipe old filesystem signatures
+    print_info "Wiping old signatures..."
+    wipefs -a "/dev/${dev}" &>/dev/null || true
+
     # Create partition table
     print_info "Creating ${pt_type} partition table..."
-    parted -s "/dev/${dev}" mklabel "$pt_type" 2>/dev/null
+    local parted_err
+    if ! parted_err=$(parted -s "/dev/${dev}" mklabel "$pt_type" 2>&1); then
+        print_fail "Failed to create partition table"
+        [[ -n "$parted_err" ]] && print_fail "$parted_err"
+        return
+    fi
     print_ok "Partition table created: ${pt_type}"
+
+    # Filesystem type hint for parted (sets correct partition type ID)
+    local parted_fs=""
+    case "$fs_type" in
+        fat32) parted_fs="fat32" ;;
+        ntfs)  parted_fs="ntfs" ;;
+        ext4)  parted_fs="ext4" ;;
+        btrfs) parted_fs="btrfs" ;;
+        xfs)   parted_fs="xfs" ;;
+    esac
 
     # Create partition
     print_info "Creating partition..."
-    parted -s "/dev/${dev}" mkpart primary 1MiB 100% 2>/dev/null
+    if [[ -n "$parted_fs" ]]; then
+        if ! parted_err=$(parted -s "/dev/${dev}" mkpart primary "$parted_fs" 1MiB 100% 2>&1); then
+            print_fail "Failed to create partition"
+            [[ -n "$parted_err" ]] && print_fail "$parted_err"
+            return
+        fi
+    else
+        if ! parted_err=$(parted -s "/dev/${dev}" mkpart primary 1MiB 100% 2>&1); then
+            print_fail "Failed to create partition"
+            [[ -n "$parted_err" ]] && print_fail "$parted_err"
+            return
+        fi
+    fi
     print_ok "Partition created"
 
     # Wait for kernel to detect partition
     partprobe "/dev/${dev}" 2>/dev/null || true
-    sleep 1
+    udevadm settle --timeout=5 2>/dev/null || sleep 2
 
-    # Determine partition name
+    # Determine partition name (handles NVMe p1 naming)
     local part_dev="${dev}1"
     if [[ ! -b "/dev/${part_dev}" ]]; then
-        # Try without number (for devices like nvme)
         part_dev="${dev}p1"
         if [[ ! -b "/dev/${part_dev}" ]]; then
-            part_dev="$dev"
+            print_fail "Partition /dev/${dev}1 not found after creation"
+            print_info "Try removing and reinserting the device"
+            return
         fi
     fi
 
-    # Format
+    # Format — array-based, no eval
     print_info "Formatting /dev/${part_dev} as ${fs_type}..."
 
-    local label_opt=""
     if [[ -n "$vol_label" ]]; then
         case "$fs_type" in
-            fat32)   label_opt="-n ${vol_label}" ;;
-            exfat)   label_opt="-L ${vol_label}" ;;
-            ntfs)    label_opt="-L ${vol_label}" ;;
-            ext4)    label_opt="-L ${vol_label}" ;;
-            btrfs)   label_opt="-L ${vol_label}" ;;
+            fat32)   mkfs_args+=("-n" "$vol_label") ;;
+            exfat)   mkfs_args+=("-L" "$vol_label") ;;
+            ntfs)    mkfs_args+=("-L" "$vol_label") ;;
+            ext4)    mkfs_args+=("-L" "$vol_label") ;;
+            btrfs)   mkfs_args+=("-L" "$vol_label") ;;
+            f2fs)    mkfs_args+=("-l" "$vol_label") ;;
+            xfs)     mkfs_args+=("-L" "$vol_label") ;;
         esac
     fi
 
-    if eval "${mkfs_cmd} ${label_opt} /dev/${part_dev}" &>/dev/null; then
+    if "${mkfs_args[@]}" "/dev/${part_dev}" 2>&1; then
         print_ok "Formatted /dev/${part_dev} as ${fs_type}"
     else
-        print_fail "Formatting failed"
+        print_fail "Formatting failed — see error above"
         return
     fi
 
     sync
+    timer_stop "Format"
     print_ok "Format complete!"
     echo ""
     echo -e "  ${GREEN}${BOLD}  /dev/${dev} formatted successfully.${NC}"
@@ -825,11 +1372,10 @@ health_badblocks() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     if ! command -v badblocks &>/dev/null; then
         print_fail "badblocks not found. Install: sudo apt install e2fsprogs"
@@ -841,9 +1387,24 @@ health_badblocks() {
         return
     fi
 
+    # Warn if partitions are mounted — badblocks may report false positives
+    local mounted_parts
+    mounted_parts=$(lsblk -rno NAME,MOUNTPOINT "/dev/${dev}" 2>/dev/null | awk '$2 != "" {print "/dev/"$1}')
+    if [[ -n "$mounted_parts" ]]; then
+        print_warn "Device has mounted partitions — results may be unreliable"
+        echo "$mounted_parts" | while IFS= read -r mp; do
+            echo -e "    ${DIM}${mp}${NC}"
+        done
+        echo ""
+        if ! confirm_action "Continue anyway?"; then
+            return
+        fi
+    fi
+
     print_info "Running read-only bad blocks test on /dev/${dev}..."
     print_info "This may take a while depending on device size."
     echo ""
+    timer_start
 
     local bad_count
     bad_count=$(badblocks -sv "/dev/${dev}" 2>&1 | tee /dev/stderr | grep -c "^[0-9]" || echo "0")
@@ -854,6 +1415,7 @@ health_badblocks() {
     else
         print_warn "${bad_count} bad blocks found on /dev/${dev}"
     fi
+    timer_stop "Bad blocks test"
     log "HEALTHCHECK: badblocks /dev/${dev} — ${bad_count} bad blocks"
 }
 
@@ -863,11 +1425,10 @@ health_smart() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     if ! command -v smartctl &>/dev/null; then
         print_fail "smartctl not found. Install: sudo apt install smartmontools"
@@ -907,13 +1468,13 @@ health_fsck() {
     local unmounted
     unmounted=$(get_unmounted_usb_partitions)
 
-    if ! select_device "$unmounted" "unmounted USB partitions"; then
+    local dev=""
+    if ! select_device "$unmounted" "unmounted USB partitions" dev; then
         echo ""
         print_warn "Only unmounted partitions can be checked."
         return
     fi
 
-    local dev="$SELECTED_DEV"
     local fstype
     fstype=$(blkid -o value -s TYPE "/dev/${dev}" 2>/dev/null || echo "")
 
@@ -932,25 +1493,31 @@ health_fsck() {
 
     print_info "Running fsck on /dev/${dev}..."
     echo ""
+    timer_start
 
+    local fsck_exit=0
     case "$fstype" in
         ext2|ext3|ext4)
             e2fsck -fvy "/dev/${dev}" 2>&1 | while IFS= read -r line; do
                 echo -e "    ${DIM}${line}${NC}"
             done
+            fsck_exit=${PIPESTATUS[0]}
             ;;
         vfat)
             fsck.vfat -vy "/dev/${dev}" 2>&1 | while IFS= read -r line; do
                 echo -e "    ${DIM}${line}${NC}"
             done
+            fsck_exit=${PIPESTATUS[0]}
             ;;
         ntfs)
             if command -v ntfsfix &>/dev/null; then
                 ntfsfix "/dev/${dev}" 2>&1 | while IFS= read -r line; do
                     echo -e "    ${DIM}${line}${NC}"
                 done
+                fsck_exit=${PIPESTATUS[0]}
             else
                 print_fail "ntfsfix not found. Install: sudo apt install ntfs-3g"
+                return
             fi
             ;;
         exfat)
@@ -958,36 +1525,70 @@ health_fsck() {
                 fsck.exfat "/dev/${dev}" 2>&1 | while IFS= read -r line; do
                     echo -e "    ${DIM}${line}${NC}"
                 done
+                fsck_exit=${PIPESTATUS[0]}
             else
                 print_fail "fsck.exfat not found. Install: sudo apt install exfat-utils"
+                return
             fi
             ;;
         btrfs)
             btrfs check "/dev/${dev}" 2>&1 | while IFS= read -r line; do
                 echo -e "    ${DIM}${line}${NC}"
             done
+            fsck_exit=${PIPESTATUS[0]}
+            ;;
+        f2fs)
+            if command -v fsck.f2fs &>/dev/null; then
+                fsck.f2fs "/dev/${dev}" 2>&1 | while IFS= read -r line; do
+                    echo -e "    ${DIM}${line}${NC}"
+                done
+                fsck_exit=${PIPESTATUS[0]}
+            else
+                print_fail "fsck.f2fs not found. Install: sudo apt install f2fs-tools"
+                return
+            fi
+            ;;
+        xfs)
+            if command -v xfs_repair &>/dev/null; then
+                xfs_repair "/dev/${dev}" 2>&1 | while IFS= read -r line; do
+                    echo -e "    ${DIM}${line}${NC}"
+                done
+                fsck_exit=${PIPESTATUS[0]}
+            else
+                print_fail "xfs_repair not found. Install: sudo apt install xfsprogs"
+                return
+            fi
             ;;
         *)
             print_warn "No fsck tool known for filesystem: ${fstype}"
+            return
             ;;
     esac
 
     echo ""
-    print_ok "Filesystem check complete"
-    log "HEALTHCHECK: fsck /dev/${dev} (${fstype})"
+    timer_stop "Filesystem check"
+
+    if [[ $fsck_exit -eq 0 ]]; then
+        print_ok "Filesystem check complete — no errors"
+    elif [[ $fsck_exit -eq 1 ]]; then
+        print_warn "Filesystem errors were corrected"
+    else
+        print_fail "Filesystem check failed (exit code: ${fsck_exit})"
+    fi
+    log "HEALTHCHECK: fsck /dev/${dev} (${fstype}) exit=${fsck_exit}"
 }
 
-health_speed_test() {
-    print_header "USB Speed Test"
+health_read_speed_test() {
+    print_header "USB Read Speed Test"
 
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
 
-    local dev="$SELECTED_DEV"
     local size_bytes
     size_bytes=$(blockdev --getsize64 "/dev/${dev}" 2>/dev/null || echo "0")
 
@@ -1008,14 +1609,89 @@ health_speed_test() {
 
     print_info "Reading ${test_size} from /dev/${dev}..."
     echo ""
+    timer_start
 
-    dd if="/dev/${dev}" of=/dev/null bs="${block_size}" count="${test_blocks}" status=progress 2>&1 | while IFS= read -r line; do
-        echo -e "    ${line}"
-    done
+    # Drop caches for accurate measurement
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    local dd_output
+    dd_output=$(dd if="/dev/${dev}" of=/dev/null bs="${block_size}" count="${test_blocks}" 2>&1)
 
     echo ""
-    print_ok "Speed test complete"
-    log "HEALTHCHECK: speed test /dev/${dev}"
+    # Extract and display speed from dd output
+    local speed
+    speed=$(echo "$dd_output" | grep -oE '[0-9.,]+ [MGKT]?B/s' | tail -1)
+    if [[ -n "$speed" ]]; then
+        echo -e "    ${BOLD}${GREEN}Read speed: ${speed}${NC}"
+    else
+        echo "$dd_output" | tail -1 | while IFS= read -r line; do
+            echo -e "    ${line}"
+        done
+    fi
+
+    echo ""
+    timer_stop "Read speed test"
+    log "HEALTHCHECK: read speed test /dev/${dev} — ${speed:-unknown}"
+}
+
+health_write_speed_test() {
+    print_header "USB Write Speed Test (DESTRUCTIVE)"
+
+    local usb_devs
+    usb_devs=$(get_usb_devices)
+
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
+        return
+    fi
+
+    if is_system_disk "$dev"; then
+        print_fail "/dev/${dev} appears to be a system disk!"
+        return
+    fi
+
+    echo ""
+    print_warn "This test WRITES data to /dev/${dev} and DESTROYS all data!"
+    echo ""
+
+    if ! double_confirm "$dev"; then
+        echo -e "  ${YELLOW}Cancelled.${NC}"
+        return
+    fi
+
+    # Unmount all partitions
+    unmount_all_partitions "$dev" true
+
+    local test_size="256MB"
+    local test_blocks=64
+    local block_size="4M"
+
+    echo ""
+    echo -e "  ${BOLD}Writing ${test_size} to /dev/${dev}...${NC}"
+    echo ""
+    timer_start
+
+    # Drop caches
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    local dd_output
+    dd_output=$(dd if=/dev/zero of="/dev/${dev}" bs="${block_size}" count="${test_blocks}" conv=fdatasync 2>&1)
+
+    echo ""
+    local speed
+    speed=$(echo "$dd_output" | grep -oE '[0-9.,]+ [MGKT]?B/s' | tail -1)
+    if [[ -n "$speed" ]]; then
+        echo -e "    ${BOLD}${GREEN}Write speed: ${speed}${NC}"
+    else
+        echo "$dd_output" | tail -1 | while IFS= read -r line; do
+            echo -e "    ${line}"
+        done
+    fi
+
+    echo ""
+    timer_stop "Write speed test"
+    print_warn "Data on /dev/${dev} has been destroyed. Format the device to use again."
+    log "HEALTHCHECK: write speed test /dev/${dev} — ${speed:-unknown}"
 }
 
 health_menu() {
@@ -1026,16 +1702,18 @@ health_menu() {
     echo -e "    ${GREEN}1)${NC}  Bad blocks test    ${DIM}(read-only scan)${NC}"
     echo -e "    ${CYAN}2)${NC}  SMART data          ${DIM}(if supported)${NC}"
     echo -e "    ${YELLOW}3)${NC}  Filesystem check    ${DIM}(fsck — device must be unmounted)${NC}"
-    echo -e "    ${MAGENTA}4)${NC}  Read speed test     ${DIM}(dd-based benchmark)${NC}"
+    echo -e "    ${MAGENTA}4)${NC}  Read speed test     ${DIM}(non-destructive dd benchmark)${NC}"
+    echo -e "    ${RED}5)${NC}  Write speed test    ${DIM}(DESTRUCTIVE — erases data!)${NC}"
     echo -e "    ${BLUE}0)${NC}  Back"
     echo ""
-    read -rp "  Choice [0-4]: " choice
+    read -rp "  Choice [0-5]: " choice
 
     case "$choice" in
         1) health_badblocks ;;
         2) health_smart ;;
         3) health_fsck ;;
-        4) health_speed_test ;;
+        4) health_read_speed_test ;;
+        5) health_write_speed_test ;;
         0) return ;;
         *) echo -e "  ${RED}Invalid choice${NC}" ;;
     esac
@@ -1053,23 +1731,61 @@ backup_to_image() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
 
-    local dev="$SELECTED_DEV"
     local size
     size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "Unknown")
+    local size_bytes
+    size_bytes=$(blockdev --getsize64 "/dev/${dev}" 2>/dev/null || echo "0")
 
     echo ""
     echo -e "  ${BOLD}Source:${NC} /dev/${dev} (${size})"
-    echo ""
 
-    local default_img="/home/$(get_current_user)/usb-backup-${dev}-$(date +%Y%m%d-%H%M%S).img"
+    # Compression choice
+    echo ""
+    echo -e "  ${BOLD}Compression:${NC}"
+    echo -e "    ${GREEN}1)${NC}  None     ${DIM}(raw .img — fastest, largest file)${NC}"
+    echo -e "    ${CYAN}2)${NC}  gzip     ${DIM}(.img.gz — good compression, slower)${NC}"
+    if command -v zstd &>/dev/null; then
+        echo -e "    ${MAGENTA}3)${NC}  zstd     ${DIM}(.img.zst — fast compression, good ratio)${NC}"
+    fi
+    echo ""
+    read -rp "  Choice [1-3]: " compress_choice
+
+    local compress="none"
+    local ext=".img"
+    case "$compress_choice" in
+        1|"") compress="none"; ext=".img" ;;
+        2) compress="gzip"; ext=".img.gz" ;;
+        3)
+            if command -v zstd &>/dev/null; then
+                compress="zstd"; ext=".img.zst"
+            else
+                print_fail "zstd not found. Install: sudo apt install zstd"
+                return
+            fi
+            ;;
+        *) echo -e "  ${RED}Invalid choice, using no compression${NC}" ;;
+    esac
+
+    echo ""
+    local default_img
+    default_img="$(get_user_home)/usb-backup-${dev}-$(date +%Y%m%d-%H%M%S)${ext}"
     read -rp "  Output file [${default_img}]: " custom_img
     local img_file="${custom_img:-$default_img}"
 
-    # Check available space
+    # Validate and expand path
+    local validated_path
+    validated_path=$(validate_filepath "$img_file")
+    if [[ $? -ne 0 || -z "$validated_path" ]]; then
+        return
+    fi
+    img_file="$validated_path"
+
+    # Check directory exists
     local img_dir
     img_dir=$(dirname "$img_file")
     if [[ ! -d "$img_dir" ]]; then
@@ -1077,26 +1793,87 @@ backup_to_image() {
         return
     fi
 
+    # Check available disk space
+    local avail_bytes
+    avail_bytes=$(df --output=avail -B1 "$img_dir" 2>/dev/null | tail -1 | tr -d ' ')
+    if [[ "$avail_bytes" =~ ^[0-9]+$ ]] && [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+        if [[ "$avail_bytes" -lt "$size_bytes" ]]; then
+            local avail_human size_human
+            avail_human=$(numfmt --to=iec "$avail_bytes" 2>/dev/null || echo "${avail_bytes} bytes")
+            size_human=$(numfmt --to=iec "$size_bytes" 2>/dev/null || echo "${size_bytes} bytes")
+            print_fail "Not enough disk space: ${avail_human} available, ${size_human} needed"
+            if [[ "$compress" == "none" ]]; then
+                print_info "Consider using compression to reduce file size."
+            fi
+            return
+        fi
+    fi
+
     echo ""
     echo -e "  ${BOLD}Backup:${NC} /dev/${dev} → ${img_file}"
-    echo -e "  ${DIM}  This will create a file approximately ${size} in size.${NC}"
+    echo -e "  ${DIM}  Device size: ${size}. Compression: ${compress}.${NC}"
 
     if ! confirm_action "Start backup?"; then
         return
     fi
 
+    CLEANUP_TMPFILES+=("$img_file")
     print_info "Backing up /dev/${dev} to ${img_file}..."
     echo ""
+    timer_start
 
-    if dd if="/dev/${dev}" of="$img_file" bs=4M status=progress 2>&1; then
+    local backup_ok=0
+    case "$compress" in
+        none)
+            if dd_with_progress "/dev/${dev}" "$img_file" "4M"; then
+                backup_ok=1
+            fi
+            ;;
+        gzip)
+            if command -v pv &>/dev/null; then
+                dd if="/dev/${dev}" bs=4M 2>/dev/null | pv -s "$size_bytes" | gzip -c > "$img_file"
+            else
+                dd if="/dev/${dev}" bs=4M 2>/dev/null | gzip -c > "$img_file"
+            fi
+            local pipe_result=("${PIPESTATUS[@]}")
+            local pipe_ok=1
+            for s in "${pipe_result[@]}"; do [[ "$s" -ne 0 ]] && pipe_ok=0; done
+            [[ $pipe_ok -eq 1 ]] && backup_ok=1
+            ;;
+        zstd)
+            if command -v pv &>/dev/null; then
+                dd if="/dev/${dev}" bs=4M 2>/dev/null | pv -s "$size_bytes" | zstd -c > "$img_file"
+            else
+                dd if="/dev/${dev}" bs=4M 2>/dev/null | zstd -c > "$img_file"
+            fi
+            local pipe_result2=("${PIPESTATUS[@]}")
+            local pipe_ok2=1
+            for s in "${pipe_result2[@]}"; do [[ "$s" -ne 0 ]] && pipe_ok2=0; done
+            [[ $pipe_ok2 -eq 1 ]] && backup_ok=1
+            ;;
+    esac
+
+    if [[ $backup_ok -eq 1 ]]; then
         sync
+        CLEANUP_TMPFILES=()
         local img_size
         img_size=$(du -h "$img_file" 2>/dev/null | cut -f1)
+        timer_stop "Backup"
         print_ok "Backup complete: ${img_file} (${img_size})"
+
         # Set ownership to user
         chown "$(get_current_user):$(get_current_user)" "$img_file" 2>/dev/null || true
-        log "BACKUP: /dev/${dev} → ${img_file} (${img_size})"
+
+        # Generate SHA256 checksum
+        print_info "Generating SHA256 checksum..."
+        local sha_file="${img_file}.sha256"
+        sha256sum "$img_file" > "$sha_file" 2>/dev/null
+        chown "$(get_current_user):$(get_current_user)" "$sha_file" 2>/dev/null || true
+        print_ok "Checksum saved: ${sha_file}"
+
+        log "BACKUP: /dev/${dev} → ${img_file} (${img_size}) compress=${compress}"
     else
+        CLEANUP_TMPFILES=()
         print_fail "Backup failed"
     fi
     echo ""
@@ -1107,9 +1884,16 @@ restore_from_image() {
     log "ACTION: Restore image to USB"
 
     echo ""
-    read -rp "  Path to image file: " img_file
+    read -rep "  Path to image file: " img_file_raw
 
-    if [[ -z "$img_file" || ! -f "$img_file" ]]; then
+    # Validate and expand path
+    local img_file
+    img_file=$(validate_filepath "$img_file_raw")
+    if [[ $? -ne 0 || -z "$img_file" ]]; then
+        return
+    fi
+
+    if [[ ! -f "$img_file" ]]; then
         print_fail "Image file not found: ${img_file}"
         return
     fi
@@ -1118,17 +1902,24 @@ restore_from_image() {
     img_size=$(du -h "$img_file" 2>/dev/null | cut -f1)
     echo -e "  ${BOLD}Image:${NC} ${img_file} (${img_size})"
 
+    # Auto-detect compression
+    local compress="none"
+    case "$img_file" in
+        *.gz)  compress="gzip" ;;
+        *.zst) compress="zstd" ;;
+    esac
+    [[ "$compress" != "none" ]] && echo -e "  ${BOLD}Compression:${NC} ${compress} (auto-detected)"
+
     local usb_devs
     usb_devs=$(get_usb_devices)
 
     echo ""
     echo -e "  ${BOLD}Select target USB device:${NC}"
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     if is_system_disk "$dev"; then
         print_fail "/dev/${dev} appears to be a system disk!"
@@ -1136,10 +1927,7 @@ restore_from_image() {
     fi
 
     # Unmount if needed
-    for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
-        sync
-        umount "/dev/${part}" 2>/dev/null || true
-    done
+    unmount_all_partitions "$dev" true
 
     if ! double_confirm "$dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -1148,9 +1936,46 @@ restore_from_image() {
 
     print_info "Restoring ${img_file} → /dev/${dev}..."
     echo ""
+    timer_start
 
-    if dd if="$img_file" of="/dev/${dev}" bs=4M status=progress conv=fdatasync 2>&1; then
+    local restore_ok=0
+    case "$compress" in
+        none)
+            if dd_with_progress "$img_file" "/dev/${dev}" "4M" "conv=fdatasync"; then
+                restore_ok=1
+            fi
+            ;;
+        gzip)
+            if command -v pv &>/dev/null; then
+                if pv "$img_file" | gunzip -c | dd of="/dev/${dev}" bs=4M 2>/dev/null; then
+                    restore_ok=1
+                fi
+            else
+                if gunzip -c "$img_file" | dd of="/dev/${dev}" bs=4M status=progress 2>&1; then
+                    restore_ok=1
+                fi
+            fi
+            ;;
+        zstd)
+            if ! command -v zstd &>/dev/null; then
+                print_fail "zstd not found. Install: sudo apt install zstd"
+                return
+            fi
+            if command -v pv &>/dev/null; then
+                if pv "$img_file" | zstd -dc | dd of="/dev/${dev}" bs=4M 2>/dev/null; then
+                    restore_ok=1
+                fi
+            else
+                if zstd -dc "$img_file" | dd of="/dev/${dev}" bs=4M status=progress 2>&1; then
+                    restore_ok=1
+                fi
+            fi
+            ;;
+    esac
+
+    if [[ $restore_ok -eq 1 ]]; then
         sync
+        timer_stop "Restore"
         print_ok "Restore complete: ${img_file} → /dev/${dev}"
         log "RESTORE: ${img_file} → /dev/${dev}"
     else
@@ -1166,7 +1991,8 @@ clone_usb_to_usb() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    local dev_arr=($usb_devs)
+    local -a dev_arr
+    read -ra dev_arr <<< "$usb_devs"
     if [[ ${#dev_arr[@]} -lt 2 ]]; then
         print_fail "Need at least 2 USB devices connected for cloning."
         return
@@ -1175,10 +2001,10 @@ clone_usb_to_usb() {
     echo ""
     echo -e "  ${BOLD}Select SOURCE device:${NC}"
 
-    if ! select_device "$usb_devs" "USB devices (source)"; then
+    local source_dev=""
+    if ! select_device "$usb_devs" "USB devices (source)" source_dev; then
         return
     fi
-    local source_dev="$SELECTED_DEV"
 
     echo ""
     echo -e "  ${BOLD}Select TARGET device:${NC}"
@@ -1190,10 +2016,10 @@ clone_usb_to_usb() {
     done
     target_list=$(echo "$target_list" | xargs)
 
-    if ! select_device "$target_list" "USB devices (target)"; then
+    local target_dev=""
+    if ! select_device "$target_list" "USB devices (target)" target_dev; then
         return
     fi
-    local target_dev="$SELECTED_DEV"
 
     if is_system_disk "$target_dev"; then
         print_fail "/dev/${target_dev} appears to be a system disk!"
@@ -1208,10 +2034,7 @@ clone_usb_to_usb() {
     echo -e "  ${BOLD}Clone:${NC} /dev/${source_dev} (${src_size}) → /dev/${target_dev} (${tgt_size})"
 
     # Unmount target
-    for part in $(lsblk -rno NAME "/dev/${target_dev}" 2>/dev/null | tail -n +2); do
-        sync
-        umount "/dev/${part}" 2>/dev/null || true
-    done
+    unmount_all_partitions "$target_dev" true
 
     if ! double_confirm "$target_dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -1220,9 +2043,11 @@ clone_usb_to_usb() {
 
     print_info "Cloning /dev/${source_dev} → /dev/${target_dev}..."
     echo ""
+    timer_start
 
-    if dd if="/dev/${source_dev}" of="/dev/${target_dev}" bs=4M status=progress conv=fdatasync 2>&1; then
+    if dd_with_progress "/dev/${source_dev}" "/dev/${target_dev}" "4M" "conv=fdatasync"; then
         sync
+        timer_stop "Clone"
         print_ok "Clone complete: /dev/${source_dev} → /dev/${target_dev}"
         log "CLONE: /dev/${source_dev} → /dev/${target_dev}"
     else
@@ -1236,8 +2061,8 @@ backup_menu() {
     echo ""
     echo -e "  ${DIM}  Create disk images, restore from images, and clone USB drives.${NC}"
     echo ""
-    echo -e "    ${GREEN}1)${NC}  Backup USB → image file   ${DIM}(dd)${NC}"
-    echo -e "    ${CYAN}2)${NC}  Restore image → USB       ${DIM}(dd)${NC}"
+    echo -e "    ${GREEN}1)${NC}  Backup USB → image file   ${DIM}(dd, optional compression)${NC}"
+    echo -e "    ${CYAN}2)${NC}  Restore image → USB       ${DIM}(dd, auto-decompression)${NC}"
     echo -e "    ${MAGENTA}3)${NC}  Clone USB → USB           ${DIM}(direct copy)${NC}"
     echo -e "    ${BLUE}0)${NC}  Back"
     echo ""
@@ -1262,15 +2087,23 @@ write_iso() {
     log "ACTION: Write ISO to USB"
 
     echo ""
-    read -rp "  Path to ISO file: " iso_file
+    read -rep "  Path to ISO file: " iso_file_raw
 
-    if [[ -z "$iso_file" || ! -f "$iso_file" ]]; then
+    # Validate and expand path
+    local iso_file
+    iso_file=$(validate_filepath "$iso_file_raw")
+    if [[ $? -ne 0 || -z "$iso_file" ]]; then
+        return
+    fi
+
+    if [[ ! -f "$iso_file" ]]; then
         print_fail "ISO file not found: ${iso_file}"
         return
     fi
 
-    local iso_size
+    local iso_size iso_bytes
     iso_size=$(du -h "$iso_file" 2>/dev/null | cut -f1)
+    iso_bytes=$(stat -c%s "$iso_file" 2>/dev/null || echo "0")
     echo -e "  ${BOLD}ISO:${NC} ${iso_file} (${iso_size})"
 
     local usb_devs
@@ -1279,19 +2112,31 @@ write_iso() {
     echo ""
     echo -e "  ${BOLD}Select target USB device:${NC}"
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     if is_system_disk "$dev"; then
         print_fail "/dev/${dev} appears to be a system disk!"
         return
     fi
 
+    local dev_size_bytes
+    dev_size_bytes=$(blockdev --getsize64 "/dev/${dev}" 2>/dev/null || echo "0")
     local dev_size
     dev_size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null)
+
+    # Check ISO fits on USB
+    if [[ "$iso_bytes" =~ ^[0-9]+$ ]] && [[ "$dev_size_bytes" =~ ^[0-9]+$ ]]; then
+        if [[ "$iso_bytes" -gt "$dev_size_bytes" ]]; then
+            local iso_human dev_human
+            iso_human=$(numfmt --to=iec "$iso_bytes" 2>/dev/null || echo "$iso_size")
+            dev_human=$(numfmt --to=iec "$dev_size_bytes" 2>/dev/null || echo "$dev_size")
+            print_fail "ISO (${iso_human}) is larger than USB device (${dev_human})"
+            return
+        fi
+    fi
 
     echo ""
     echo -e "  ${BOLD}Summary:${NC}"
@@ -1299,10 +2144,7 @@ write_iso() {
     echo -e "    Target: /dev/${dev} (${dev_size})"
 
     # Unmount if needed
-    for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
-        sync
-        umount "/dev/${part}" 2>/dev/null || true
-    done
+    unmount_all_partitions "$dev" true
 
     if ! double_confirm "$dev"; then
         echo -e "  ${YELLOW}Cancelled.${NC}"
@@ -1311,9 +2153,11 @@ write_iso() {
 
     print_info "Writing ISO to /dev/${dev}..."
     echo ""
+    timer_start
 
-    if dd if="$iso_file" of="/dev/${dev}" bs=4M status=progress conv=fdatasync 2>&1; then
+    if dd_with_progress "$iso_file" "/dev/${dev}" "4M" "conv=fdatasync"; then
         sync
+        timer_stop "ISO write"
         print_ok "ISO written to /dev/${dev}"
         log "WRITE ISO: ${iso_file} → /dev/${dev}"
     else
@@ -1324,29 +2168,36 @@ write_iso() {
     # Verify
     echo ""
     echo -e "  ${BOLD}Verify write?${NC}"
-    echo -e "    ${GREEN}1)${NC}  Yes — compare checksums ${DIM}(recommended)${NC}"
+    echo -e "    ${GREEN}1)${NC}  Yes — compare SHA256 checksums ${DIM}(recommended)${NC}"
     echo -e "    ${CYAN}2)${NC}  No  — skip verification"
     echo ""
     read -rp "  Choice [1-2]: " verify
 
     if [[ "$verify" == "1" || -z "$verify" ]]; then
-        print_info "Calculating ISO checksum..."
-        local iso_md5
-        iso_md5=$(md5sum "$iso_file" 2>/dev/null | cut -d' ' -f1)
-        echo -e "    ISO:    ${iso_md5}"
-
-        print_info "Calculating USB checksum (reading same size as ISO)..."
-        local iso_bytes
-        iso_bytes=$(stat -c%s "$iso_file" 2>/dev/null)
-        local usb_md5
-        usb_md5=$(dd if="/dev/${dev}" bs=4M count=$((iso_bytes / 4194304 + 1)) 2>/dev/null | head -c "$iso_bytes" | md5sum | cut -d' ' -f1)
-        echo -e "    USB:    ${usb_md5}"
-
-        echo ""
-        if [[ "$iso_md5" == "$usb_md5" ]]; then
-            print_ok "Checksums match — write verified!"
+        if [[ ! "$iso_bytes" =~ ^[0-9]+$ ]] || [[ "$iso_bytes" -eq 0 ]]; then
+            print_fail "Cannot determine ISO file size — skipping verification"
         else
-            print_fail "Checksums DO NOT match! Write may be corrupted."
+            print_info "Calculating ISO SHA256 checksum..."
+            local iso_sha
+            iso_sha=$(sha256sum "$iso_file" 2>/dev/null | cut -d' ' -f1)
+            if [[ -z "$iso_sha" ]]; then
+                print_fail "Failed to calculate ISO checksum"
+            else
+                echo -e "    ISO:    ${iso_sha}"
+
+                print_info "Calculating USB SHA256 checksum (reading same size as ISO)..."
+                local usb_sha
+                local dd_count=$(( (iso_bytes + 4194303) / 4194304 ))
+                usb_sha=$(dd if="/dev/${dev}" bs=4M count="${dd_count}" 2>/dev/null | head -c "$iso_bytes" | sha256sum | cut -d' ' -f1)
+                echo -e "    USB:    ${usb_sha}"
+
+                echo ""
+                if [[ "$iso_sha" == "$usb_sha" ]]; then
+                    print_ok "SHA256 checksums match — write verified!"
+                else
+                    print_fail "SHA256 checksums DO NOT match! Write may be corrupted."
+                fi
+            fi
         fi
     fi
 
@@ -1388,8 +2239,8 @@ wipe_quick() {
     local size_bytes
     size_bytes=$(blockdev --getsize64 "/dev/${dev}" 2>/dev/null || echo "0")
     if [[ "$size_bytes" -gt 1048576 ]]; then
-        local skip_mb=$(( (size_bytes - 1048576) / 1048576 ))
-        dd if=/dev/zero of="/dev/${dev}" bs=1M seek="${skip_mb}" status=progress 2>&1 || true
+        local tail_offset=$(( size_bytes - 1048576 ))
+        dd if=/dev/zero of="/dev/${dev}" bs=1 seek="${tail_offset}" count=1048576 conv=notrunc status=progress 2>&1 || true
     fi
     # Wipe signatures
     wipefs -a "/dev/${dev}" &>/dev/null || true
@@ -1402,9 +2253,20 @@ wipe_full_zero() {
     print_info "Full zero wipe: writing zeros to entire disk..."
     log "WIPE (full zero): /dev/${dev}"
 
-    dd if=/dev/zero of="/dev/${dev}" bs=4M status=progress 2>&1 || true
-    sync
-    print_ok "Full zero wipe complete on /dev/${dev}"
+    # dd returns nonzero when hitting end-of-device (expected)
+    # but I/O errors should be reported
+    if dd_with_progress "/dev/zero" "/dev/${dev}" "4M"; then
+        sync
+        print_ok "Full zero wipe complete on /dev/${dev}"
+    else
+        sync
+        # Check if device still exists (dd error vs end-of-device)
+        if [[ -b "/dev/${dev}" ]]; then
+            print_warn "Wipe finished with warnings on /dev/${dev} (may be normal for end-of-device)"
+        else
+            print_fail "Device /dev/${dev} disappeared during wipe — device may have been removed"
+        fi
+    fi
 }
 
 wipe_random() {
@@ -1412,9 +2274,17 @@ wipe_random() {
     print_info "Random wipe: writing random data to entire disk..."
     log "WIPE (random): /dev/${dev}"
 
-    dd if=/dev/urandom of="/dev/${dev}" bs=4M status=progress 2>&1 || true
-    sync
-    print_ok "Random wipe complete on /dev/${dev}"
+    if dd_with_progress "/dev/urandom" "/dev/${dev}" "4M"; then
+        sync
+        print_ok "Random wipe complete on /dev/${dev}"
+    else
+        sync
+        if [[ -b "/dev/${dev}" ]]; then
+            print_warn "Wipe finished with warnings on /dev/${dev} (may be normal for end-of-device)"
+        else
+            print_fail "Device /dev/${dev} disappeared during wipe — device may have been removed"
+        fi
+    fi
 }
 
 wipe_multipass() {
@@ -1422,22 +2292,30 @@ wipe_multipass() {
     print_info "Multi-pass wipe (3 passes): random → zeros → random..."
     log "WIPE (multi-pass): /dev/${dev}"
 
+    local pass_fail=0
+
     echo ""
     echo -e "    ${BOLD}Pass 1/3: Random data...${NC}"
-    dd if=/dev/urandom of="/dev/${dev}" bs=4M status=progress 2>&1 || true
+    dd_with_progress "/dev/urandom" "/dev/${dev}" "4M" || pass_fail=1
     sync
+    [[ ! -b "/dev/${dev}" ]] && { print_fail "Device removed during wipe"; return; }
 
     echo ""
     echo -e "    ${BOLD}Pass 2/3: Zero fill...${NC}"
-    dd if=/dev/zero of="/dev/${dev}" bs=4M status=progress 2>&1 || true
+    dd_with_progress "/dev/zero" "/dev/${dev}" "4M" || pass_fail=1
     sync
+    [[ ! -b "/dev/${dev}" ]] && { print_fail "Device removed during wipe"; return; }
 
     echo ""
     echo -e "    ${BOLD}Pass 3/3: Random data...${NC}"
-    dd if=/dev/urandom of="/dev/${dev}" bs=4M status=progress 2>&1 || true
+    dd_with_progress "/dev/urandom" "/dev/${dev}" "4M" || pass_fail=1
     sync
 
-    print_ok "Multi-pass wipe complete on /dev/${dev} (3 passes)"
+    if [[ $pass_fail -eq 0 ]]; then
+        print_ok "Multi-pass wipe complete on /dev/${dev} (3 passes)"
+    else
+        print_warn "Multi-pass wipe finished with warnings on /dev/${dev} (may be normal for end-of-device)"
+    fi
 }
 
 secure_wipe() {
@@ -1447,11 +2325,10 @@ secure_wipe() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     if is_system_disk "$dev"; then
         print_fail "/dev/${dev} appears to be a system disk!"
@@ -1465,10 +2342,7 @@ secure_wipe() {
     echo -e "  ${BOLD}Device:${NC} /dev/${dev} (${size})"
 
     # Unmount all partitions
-    for part in $(lsblk -rno NAME "/dev/${dev}" 2>/dev/null | tail -n +2); do
-        sync
-        umount "/dev/${part}" 2>/dev/null || true
-    done
+    unmount_all_partitions "$dev" true
 
     echo ""
     echo -e "  ${BOLD}Wipe method:${NC}"
@@ -1493,6 +2367,7 @@ secure_wipe() {
     fi
 
     echo ""
+    timer_start
 
     case "$wipe_mode" in
         1) wipe_quick "$dev" ;;
@@ -1501,6 +2376,7 @@ secure_wipe() {
         4) wipe_multipass "$dev" ;;
     esac
 
+    timer_stop "Wipe"
     echo ""
     echo -e "  ${GREEN}${BOLD}  Wipe complete on /dev/${dev}.${NC}"
     echo -e "  ${DIM}  The device is now empty. Format it to use again.${NC}"
@@ -1535,11 +2411,10 @@ quick_safe_eject() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
-
-    local dev="$SELECTED_DEV"
 
     echo ""
     echo -e "  ${BOLD}Ejecting /dev/${dev}...${NC}"
@@ -1549,33 +2424,56 @@ quick_safe_eject() {
     sync
 
     # Unmount all partitions
-    local unmounted=0
-    for part in $(lsblk -rno NAME,MOUNTPOINT "/dev/${dev}" 2>/dev/null | awk '$2 != "" {print $1}'); do
-        if umount "/dev/${part}" 2>/dev/null; then
-            print_ok "Unmounted /dev/${part}"
-            unmounted=$((unmounted + 1))
-        fi
-    done
-
-    if [[ $unmounted -eq 0 ]]; then
-        print_info "No mounted partitions to unmount."
+    local unmount_ok=true
+    if ! unmount_all_partitions "$dev"; then
+        print_warn "Some partitions could not be unmounted"
+        unmount_ok=false
     fi
 
-    # Power off USB device
-    local sys_dev="/sys/block/${dev}/device"
-    if [[ -f "${sys_dev}/delete" ]]; then
-        echo 1 > "${sys_dev}/delete" 2>/dev/null
-        print_ok "Device powered off"
-    elif [[ -f "${sys_dev}/../../remove" ]]; then
-        echo 1 > "${sys_dev}/../../remove" 2>/dev/null
-        print_ok "USB port deauthorized"
+    # Power off USB device (try udisksctl first, then sysfs)
+    local poweroff_ok=false
+    if command -v udisksctl &>/dev/null; then
+        if udisksctl power-off -b "/dev/${dev}" 2>/dev/null; then
+            print_ok "Device powered off (udisksctl)"
+            poweroff_ok=true
+        else
+            print_info "udisksctl failed — trying sysfs..."
+            local sys_dev="/sys/block/${dev}/device"
+            if [[ -f "${sys_dev}/delete" ]]; then
+                echo 1 > "${sys_dev}/delete" 2>/dev/null
+                print_ok "Device powered off (sysfs)"
+                poweroff_ok=true
+            elif [[ -f "${sys_dev}/../../remove" ]]; then
+                echo 1 > "${sys_dev}/../../remove" 2>/dev/null
+                print_ok "USB port deauthorized"
+                poweroff_ok=true
+            fi
+        fi
     else
-        print_info "Could not power off device — safe to remove after sync."
+        local sys_dev="/sys/block/${dev}/device"
+        if [[ -f "${sys_dev}/delete" ]]; then
+            echo 1 > "${sys_dev}/delete" 2>/dev/null
+            print_ok "Device powered off"
+            poweroff_ok=true
+        elif [[ -f "${sys_dev}/../../remove" ]]; then
+            echo 1 > "${sys_dev}/../../remove" 2>/dev/null
+            print_ok "USB port deauthorized"
+            poweroff_ok=true
+        fi
     fi
 
     echo ""
-    echo -e "  ${GREEN}${BOLD}  Safe to remove /dev/${dev}.${NC}"
-    log "EJECT: /dev/${dev}"
+    if [[ "$unmount_ok" == "true" ]]; then
+        if [[ "$poweroff_ok" == "true" ]]; then
+            echo -e "  ${GREEN}${BOLD}  Safe to remove /dev/${dev}.${NC}"
+        else
+            echo -e "  ${YELLOW}${BOLD}  Could not power off — safe to remove after sync.${NC}"
+        fi
+        log "EJECT: /dev/${dev}"
+    else
+        echo -e "  ${RED}${BOLD}  WARNING: Some partitions still mounted — do NOT remove /dev/${dev}!${NC}"
+        log "EJECT FAILED: /dev/${dev} — partitions still mounted"
+    fi
     echo ""
 }
 
@@ -1585,33 +2483,15 @@ quick_device_info() {
     local usb_devs
     usb_devs=$(get_usb_devices)
 
-    if ! select_device "$usb_devs" "USB devices"; then
+    local dev=""
+    if ! select_device "$usb_devs" "USB devices" dev; then
         return
     fi
 
-    local dev="$SELECTED_DEV"
-
     echo ""
     print_section "A" "Device Summary: /dev/${dev}"
-
-    local size model serial vendor_id product_id removable
-    size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "Unknown")
-    model=$(cat "/sys/block/${dev}/device/model" 2>/dev/null | xargs || echo "Unknown")
-    serial=$(cat "/sys/block/${dev}/device/../../serial" 2>/dev/null | xargs || echo "N/A")
-    vendor_id=$(cat "/sys/block/${dev}/device/../../idVendor" 2>/dev/null || echo "????")
-    product_id=$(cat "/sys/block/${dev}/device/../../idProduct" 2>/dev/null || echo "????")
-    removable=$(cat "/sys/block/${dev}/removable" 2>/dev/null || echo "?")
-
-    local manufacturer
-    manufacturer=$(cat "/sys/block/${dev}/device/../../manufacturer" 2>/dev/null | xargs || echo "Unknown")
-
     echo ""
-    echo -e "    ${BOLD}Model:${NC}        ${model}"
-    echo -e "    ${BOLD}Manufacturer:${NC} ${manufacturer}"
-    echo -e "    ${BOLD}Size:${NC}         ${size}"
-    echo -e "    ${BOLD}VID:PID:${NC}      ${vendor_id}:${product_id}"
-    echo -e "    ${BOLD}Serial:${NC}       ${serial}"
-    echo -e "    ${BOLD}Removable:${NC}    ${removable}"
+    print_device_details "$dev"
 
     print_section "B" "Partitions"
 
@@ -1622,12 +2502,11 @@ quick_device_info() {
     print_section "C" "Block Device Info"
 
     echo ""
-    local ro sched
-    ro=$(cat "/sys/block/${dev}/ro" 2>/dev/null || echo "?")
-    sched=$(cat "/sys/block/${dev}/queue/scheduler" 2>/dev/null || echo "?")
-    local logical_bs physical_bs
-    logical_bs=$(cat "/sys/block/${dev}/queue/logical_block_size" 2>/dev/null || echo "?")
-    physical_bs=$(cat "/sys/block/${dev}/queue/physical_block_size" 2>/dev/null || echo "?")
+    local ro sched logical_bs physical_bs
+    ro=$(read_sysfs "/sys/block/${dev}/ro" "?")
+    sched=$(read_sysfs "/sys/block/${dev}/queue/scheduler" "?")
+    logical_bs=$(read_sysfs "/sys/block/${dev}/queue/logical_block_size" "?")
+    physical_bs=$(read_sysfs "/sys/block/${dev}/queue/physical_block_size" "?")
 
     echo -e "    ${BOLD}Read-only:${NC}       ${ro}"
     echo -e "    ${BOLD}Scheduler:${NC}       ${sched}"
@@ -1635,6 +2514,96 @@ quick_device_info() {
     echo -e "    ${BOLD}Physical BS:${NC}     ${physical_bs}"
 
     echo ""
+}
+
+# ============================================================================
+#  CLI Arguments
+# ============================================================================
+
+cli_help() {
+    cat <<HELPEOF
+USB TOOLKIT v${SCRIPT_VERSION} — USB Device Operations & Management
+
+Usage: sudo bash usb-toolkit.sh [OPTION]
+
+Options:
+  --help       Show this help message and exit
+  --version    Show version and exit
+  --list       List connected USB storage devices (non-interactive)
+
+Interactive mode (no arguments):
+  Launches the full interactive menu with all operations.
+
+Categories:
+  1. USB Detection    — List and identify connected USB storage devices
+  2. Mount USB        — Mount USB partitions with various options
+  3. Unmount USB      — Safe unmount with sync and process check
+  4. Format USB       — Format with filesystem and partition table choice
+  5. Health Check     — badblocks, SMART, fsck, read/write speed test
+  6. Backup & Clone   — Image backup (with compression), restore, clone
+  7. Write ISO        — Write bootable ISO image to USB
+  8. Secure Wipe      — Quick, full, random, and multi-pass wipe
+
+Quick Actions:
+  9. Safe Eject       — sync + unmount + power off
+ 10. Device Info      — Quick summary of a selected USB device
+
+Requires: root privileges (sudo)
+HELPEOF
+}
+
+cli_version() {
+    echo "USB TOOLKIT v${SCRIPT_VERSION}"
+}
+
+cli_list() {
+    check_root
+    local usb_devs
+    usb_devs=$(get_usb_devices)
+
+    if [[ -z "$usb_devs" ]]; then
+        echo "No USB storage devices detected."
+        exit 0
+    fi
+
+    printf "%-12s  %-8s  %-20s  %-16s  %-10s\n" "DEVICE" "SIZE" "MODEL" "SERIAL" "USB SPEED"
+    printf "%-12s  %-8s  %-20s  %-16s  %-10s\n" "------" "----" "-----" "------" "---------"
+
+    for dev in $usb_devs; do
+        local size model serial usb_speed
+        size=$(lsblk -dnro SIZE "/dev/${dev}" 2>/dev/null || echo "?")
+        model=$(read_sysfs "/sys/block/${dev}/device/model" "Unknown")
+        serial=$(read_sysfs "/sys/block/${dev}/device/../../serial" "N/A")
+        usb_speed=$(get_usb_speed "$dev")
+        printf "%-12s  %-8s  %-20s  %-16s  %s\n" "/dev/${dev}" "$size" "$model" "$serial" "$usb_speed"
+    done
+}
+
+# Handle CLI arguments before interactive mode
+handle_cli_args() {
+    case "${1:-}" in
+        --help|-h)
+            cli_help
+            exit 0
+            ;;
+        --version|-V)
+            cli_version
+            exit 0
+            ;;
+        --list|-l)
+            cli_list
+            exit 0
+            ;;
+        "")
+            # No args — continue to interactive mode
+            return 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: sudo bash usb-toolkit.sh [--help|--version|--list]"
+            exit 1
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -1668,7 +2637,7 @@ main_menu() {
             for d in $usb_devs; do
                 local sz mdl
                 sz=$(lsblk -dnro SIZE "/dev/${d}" 2>/dev/null || echo "?")
-                mdl=$(cat "/sys/block/${d}/device/model" 2>/dev/null | xargs || echo "")
+                mdl=$(read_sysfs "/sys/block/${d}/device/model" "")
                 echo -e "    ${DIM}/dev/${d}  ${sz}  ${mdl}${NC}"
             done
         fi
@@ -1724,6 +2693,9 @@ main_menu() {
 #  Launch
 # ============================================================================
 
+handle_cli_args "$@"
 check_root
 check_dependencies
+acquire_lock || exit 1
+log "========== USB TOOLKIT v${SCRIPT_VERSION} STARTED =========="
 main_menu
